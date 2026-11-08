@@ -1,0 +1,14 @@
+import "mbuild/api";
+
+fn project() {
+  mb_package("docxtopdf", "0.1.0");
+  mb_meta("description", "DOCX and PDF conversion in pure Mettle: docx to pdf and pdf to docx");
+  mb_meta("license", "Apache-2.0");
+  mb_import_root("src");
+  mb_bin("docxtopdf", "src/main.mettle");
+}
+
+fn deps() {
+  // Press is the pure-Mettle DEFLATE implementation used for ZIP and PDF streams.
+  mb_dep_path("press", "../mettle/press");
+}

@@ -1,0 +1,333 @@
+// ZIP container support for DOCX (and any OOXML package).
+//
+// Reading: central-directory driven, store and DEFLATE, CRC checked.
+// Writing: store or DEFLATE, UTF-8 names, no data descriptors.
+
+import "std/mem";
+import "vec";
+import "std/arena";
+import "press/press";
+import "buf";
+import "xml";
+
+export struct DxpZipEntry {
+  name: string;
+  comp_method: int32;
+  flags: int32;
+  crc: uint32;
+  comp_size: int64;
+  uncomp_size: int64;
+  local_off: int64;
+}
+
+export struct DxpZip {
+  data: uint8*;
+  len: int64;
+  entries: DxpVec<DxpZipEntry>;
+  comment: string;
+  err: int32;
+}
+
+fn dxp_zip_u16(p: uint8*, off: int64) -> uint32 {
+  return (uint32)p[off] | ((uint32)p[off + 1] << 8);
+}
+
+fn dxp_zip_u32(p: uint8*, off: int64) -> uint32 {
+  return (uint32)p[off] | ((uint32)p[off + 1] << 8) |
+         ((uint32)p[off + 2] << 16) | ((uint32)p[off + 3] << 24);
+}
+
+fn dxp_zip_sig(p: uint8*, off: int64, a: uint32) -> bool {
+  return dxp_zip_u32(p, off) == a;
+}
+
+export fn dxp_zip_open(z: DxpZip*, data: uint8*, len: int64, arena: Arena*) -> int32 {
+  z->data = data;
+  z->len = len;
+  z->entries = dxp_vec_init<DxpZipEntry>();
+  z->comment = "";
+  z->err = 0;
+  if (data == 0 || len < 22) {
+    z->err = 1;
+    return -1;
+  }
+
+  // Find End Of Central Directory, scanning backwards over the comment.
+  var eocd: int64 = -1;
+  var lowest: int64 = len - 65557;
+  if (lowest < 0) { lowest = 0; }
+  var i: int64 = len - 22;
+  while (i >= lowest) {
+    if (dxp_zip_sig(data, i, 0x06054b50)) {
+      eocd = i;
+      break;
+    }
+    i = i - 1;
+  }
+  if (eocd < 0) {
+    z->err = 2;
+    return -2;
+  }
+  var count: int64 = (int64)dxp_zip_u16(data, eocd + 10);
+  var cd_off: int64 = (int64)dxp_zip_u32(data, eocd + 16);
+  var cd_end: int64 = (int64)dxp_zip_u32(data, eocd + 12) + cd_off;
+  if (cd_off < 0 || cd_off >= len || cd_end > len) {
+    z->err = 3;
+    return -3;
+  }
+  var p: int64 = cd_off;
+  var n: int64 = 0;
+  while (n < count && p + 46 <= cd_end) {
+    if (!dxp_zip_sig(data, p, 0x02014b50)) { break; }
+    var flags: int32 = (int32)dxp_zip_u16(data, p + 8);
+    var mth: int32 = (int32)dxp_zip_u16(data, p + 10);
+    var crc: uint32 = dxp_zip_u32(data, p + 16);
+    var comp: int64 = (int64)dxp_zip_u32(data, p + 20);
+    var uncomp: int64 = (int64)dxp_zip_u32(data, p + 24);
+    var nlen: int64 = (int64)dxp_zip_u16(data, p + 28);
+    var xlen: int64 = (int64)dxp_zip_u16(data, p + 30);
+    var clen: int64 = (int64)dxp_zip_u16(data, p + 32);
+    var local: int64 = (int64)dxp_zip_u32(data, p + 42);
+    if (p + 46 + nlen + xlen + clen > len) { break; }
+
+    // ZIP64 values are stored in the extra field.
+    if (comp == 0xFFFFFFFF || uncomp == 0xFFFFFFFF || local == 0xFFFFFFFF) {
+      var x: int64 = p + 46 + nlen;
+      var xe: int64 = x + xlen;
+      while (x + 4 <= xe) {
+        var id: uint32 = dxp_zip_u16(data, x);
+        var sz: int64 = (int64)dxp_zip_u16(data, x + 2);
+        if (x + 4 + sz > xe) { break; }
+        if (id == 1) {
+          var q: int64 = x + 4;
+          if (uncomp == 0xFFFFFFFF && q + 8 <= x + 4 + sz) {
+            uncomp = (int64)dxp_zip_u32(data, q) | ((int64)dxp_zip_u32(data, q + 4) << 32);
+            q = q + 8;
+          }
+          if (comp == 0xFFFFFFFF && q + 8 <= x + 4 + sz) {
+            comp = (int64)dxp_zip_u32(data, q) | ((int64)dxp_zip_u32(data, q + 4) << 32);
+            q = q + 8;
+          }
+          if (local == 0xFFFFFFFF && q + 8 <= x + 4 + sz) {
+            local = (int64)dxp_zip_u32(data, q) | ((int64)dxp_zip_u32(data, q + 4) << 32);
+          }
+          break;
+        }
+        x = x + 4 + sz;
+      }
+    }
+
+    var e: DxpZipEntry;
+    var nv: string;
+    nv.chars = data + p + 46;
+    nv.length = (uint64)nlen;
+    e.name = dxp_str_dup_arena(arena, nv);
+    e.comp_method = mth;
+    e.flags = flags;
+    e.crc = crc;
+    e.comp_size = comp;
+    e.uncomp_size = uncomp;
+    e.local_off = local;
+    dxp_vec_push<DxpZipEntry>(&z->entries, e);
+    p = p + 46 + nlen + xlen + clen;
+    n = n + 1;
+  }
+  if (z->entries.length == 0) {
+    z->err = 4;
+    return -4;
+  }
+  return 0;
+}
+
+export fn dxp_zip_close(z: DxpZip*) {
+  dxp_vec_free<DxpZipEntry>(&z->entries);
+  z->data = 0;
+  z->len = 0;
+}
+
+export fn dxp_zip_find(z: DxpZip*, name: string) -> DxpZipEntry* {
+  for i in 0..z->entries.length {
+    var e: DxpZipEntry* = &z->entries.data[i];
+    if (e->name == name) { return e; }
+  }
+  return 0;
+}
+
+export fn dxp_zip_read(z: DxpZip*, e: DxpZipEntry*, out: DxpBuf*) -> int32 {
+  if (e == 0 || z->data == 0) { return -1; }
+  if ((e->flags & 1) != 0) { return -2; } // encrypted
+  var off: int64 = e->local_off;
+  if (off < 0 || off + 30 > z->len) { return -3; }
+  if (!dxp_zip_sig(z->data, off, 0x04034b50)) { return -4; }
+  var nlen: int64 = (int64)dxp_zip_u16(z->data, off + 26);
+  var xlen: int64 = (int64)dxp_zip_u16(z->data, off + 28);
+  var dstart: int64 = off + 30 + nlen + xlen;
+  if (dstart < 0 || dstart + e->comp_size > z->len) { return -5; }
+
+  if (e->comp_method == 0) {
+    if (dxp_buf_append(out, z->data + dstart, e->comp_size) != 0) { return -6; }
+  } else if (e->comp_method == 8) {
+    var pb: PressBuf;
+    press_buf_limit(&pb, e->uncomp_size + 1);
+    var rc: int32 = press_deflate_decompress(z->data + dstart, e->comp_size, &pb);
+    if (rc != PRESS_OK) {
+      press_buf_free(&pb);
+      return -7;
+    }
+    if (dxp_buf_append(out, pb.data, pb.len) != 0) {
+      press_buf_free(&pb);
+      return -8;
+    }
+    press_buf_free(&pb);
+  } else {
+    return -9; // unsupported method
+  }
+  if (out->len != e->uncomp_size) { return -10; }
+  if (e->crc != 0) {
+    var crc: uint32 = press_crc32(0, out->data, out->len);
+    if (crc != e->crc) { return -11; }
+  }
+  return 0;
+}
+
+// Read a whole entry by name into a fresh heap block. The caller owns the
+// block. Returns 0 on failure.
+export fn dxp_zip_read_named(z: DxpZip*, name: string, len_out: int64*) -> uint8* {
+  var e: DxpZipEntry* = dxp_zip_find(z, name);
+  if (e == 0) { return 0; }
+  var b: DxpBuf;
+  if (dxp_zip_read(z, e, &b) != 0) {
+    dxp_buf_free(&b);
+    return 0;
+  }
+  var p: uint8* = b.data;
+  *len_out = b.len;
+  b.data = 0;
+  b.len = 0;
+  b.cap = 0;
+  return p;
+}
+
+export struct DxpZipOutEntry {
+  name: string;
+  data: uint8*;
+  len: int64;
+  crc: uint32;
+  comp_method: int32;
+  comp: uint8*;
+  comp_len: int64;
+  offset: int64;
+}
+
+export struct DxpZipOut {
+  entries: DxpVec<DxpZipOutEntry>;
+}
+
+export fn dxp_zip_out_init(z: DxpZipOut*) {
+  z->entries = dxp_vec_init<DxpZipOutEntry>();
+}
+
+export fn dxp_zip_out_add(z: DxpZipOut*, name: string, data: uint8*, len: int64) {
+  var e: DxpZipOutEntry;
+  e.name = name;
+  e.data = data;
+  e.len = len;
+  e.crc = press_crc32(0, data, len);
+  e.comp_method = 0;
+  e.comp = 0;
+  e.comp_len = 0;
+  e.offset = 0;
+  if (len > 64) {
+    var pb: PressBuf;
+    var rc: int32 = press_deflate_compress(data, len, 6, &pb);
+    if (rc == PRESS_OK && pb.len < len) {
+      e.comp_method = 8;
+      e.comp = (uint8*)malloc(pb.len);
+      if (e.comp != 0) {
+        memcpy(e.comp, pb.data, pb.len);
+        e.comp_len = pb.len;
+      } else {
+        e.comp_method = 0;
+      }
+    }
+    press_buf_free(&pb);
+  }
+  if (e.comp_method == 0) {
+    e.comp = data;
+    e.comp_len = len;
+  }
+  dxp_vec_push<DxpZipOutEntry>(&z->entries, e);
+}
+
+export fn dxp_zip_out_free(z: DxpZipOut*) {
+  for i in 0..z->entries.length {
+    var e: DxpZipOutEntry* = &z->entries.data[i];
+    if (e->comp_method == 8 && e->comp != 0) { free(e->comp); }
+  }
+  dxp_vec_free<DxpZipOutEntry>(&z->entries);
+}
+
+fn dxp_zip_write_u16(out: DxpBuf*, v: uint32) {
+  dxp_buf_put(out, (uint8)(v & 255));
+  dxp_buf_put(out, (uint8)((v >> 8) & 255));
+}
+
+fn dxp_zip_write_u32(out: DxpBuf*, v: uint32) {
+  dxp_buf_put(out, (uint8)(v & 255));
+  dxp_buf_put(out, (uint8)((v >> 8) & 255));
+  dxp_buf_put(out, (uint8)((v >> 16) & 255));
+  dxp_buf_put(out, (uint8)((v >> 24) & 255));
+}
+
+export fn dxp_zip_out_finish(z: DxpZipOut*, out: DxpBuf*) -> int32 {
+  for i in 0..z->entries.length {
+    var e: DxpZipOutEntry* = &z->entries.data[i];
+    e->offset = out->len;
+    dxp_zip_write_u32(out, 0x04034b50);
+    dxp_zip_write_u16(out, 20);
+    dxp_zip_write_u16(out, 0x0800); // UTF-8 names
+    dxp_zip_write_u16(out, (uint32)e->comp_method);
+    dxp_zip_write_u16(out, 0);      // time
+    dxp_zip_write_u16(out, 0x21);   // 1980-01-01
+    dxp_zip_write_u32(out, e->crc);
+    dxp_zip_write_u32(out, (uint32)e->comp_len);
+    dxp_zip_write_u32(out, (uint32)e->len);
+    dxp_zip_write_u16(out, (uint32)e->name.length);
+    dxp_zip_write_u16(out, 0);
+    dxp_buf_puts(out, e->name);
+    dxp_buf_append(out, e->comp, e->comp_len);
+  }
+  var cd_off: int64 = out->len;
+  for i in 0..z->entries.length {
+    var e: DxpZipOutEntry* = &z->entries.data[i];
+    dxp_zip_write_u32(out, 0x02014b50);
+    dxp_zip_write_u16(out, 20);
+    dxp_zip_write_u16(out, 20);
+    dxp_zip_write_u16(out, 0x0800);
+    dxp_zip_write_u16(out, (uint32)e->comp_method);
+    dxp_zip_write_u16(out, 0);
+    dxp_zip_write_u16(out, 0x21);
+    dxp_zip_write_u32(out, e->crc);
+    dxp_zip_write_u32(out, (uint32)e->comp_len);
+    dxp_zip_write_u32(out, (uint32)e->len);
+    dxp_zip_write_u16(out, (uint32)e->name.length);
+    dxp_zip_write_u16(out, 0);
+    dxp_zip_write_u16(out, 0);
+    dxp_zip_write_u16(out, 0);
+    dxp_zip_write_u16(out, 0);
+    dxp_zip_write_u32(out, 0);
+    dxp_zip_write_u32(out, (uint32)e->offset);
+    dxp_buf_puts(out, e->name);
+  }
+  var cd_len: int64 = out->len - cd_off;
+  dxp_zip_write_u32(out, 0x06054b50);
+  dxp_zip_write_u16(out, 0);
+  dxp_zip_write_u16(out, 0);
+  dxp_zip_write_u16(out, (uint32)z->entries.length);
+  dxp_zip_write_u16(out, (uint32)z->entries.length);
+  dxp_zip_write_u32(out, (uint32)cd_len);
+  dxp_zip_write_u32(out, (uint32)cd_off);
+  dxp_zip_write_u16(out, 0);
+  if (out->failed != 0) { return -1; }
+  return 0;
+}

@@ -1,0 +1,242 @@
+// Standard PDF Type 1 fonts: selection, metrics and WinAnsi encoding.
+//
+// The output uses the 14 fonts every PDF reader ships (Helvetica, Times and
+// Courier families), so no font file has to be embedded. Text outside
+// WinAnsi is transliterated to a safe character.
+
+import "buf";
+
+const DXP_FONT_COUNT: int32 = 12;
+
+// Helvetica ASCII widths (AFM units per 1000 em), 32..126.
+const DXP_HELV: int32[95] = [
+  278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
+  556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
+  1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+  667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
+  333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
+  556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584
+];
+
+// Times-Roman ASCII widths, 32..126.
+const DXP_TIMES: int32[95] = [
+  250, 333, 408, 500, 500, 833, 778, 180, 333, 333, 500, 564, 250, 333, 250, 278,
+  500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444,
+  921, 722, 667, 667, 722, 611, 556, 722, 722, 333, 389, 722, 611, 889, 722, 722,
+  556, 722, 667, 556, 611, 722, 722, 944, 722, 722, 611, 333, 278, 333, 469, 500,
+  333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278, 500, 278, 778, 500, 500,
+  500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541
+];
+
+fn dxp_font_is_bold(id: int32) -> bool {
+  return id == 1 || id == 3 || id == 5 || id == 7 || id == 9 || id == 11;
+}
+
+fn dxp_font_is_italic(id: int32) -> bool {
+  return id == 2 || id == 3 || id == 6 || id == 7 || id == 10 || id == 11;
+}
+
+export fn dxp_font_pick(base: int32, bold: bool, italic: bool) -> int32 {
+  if (base == DXP_FONT_MONO) {
+    if (bold && italic) { return 11; }
+    if (bold) { return 9; }
+    if (italic) { return 10; }
+    return 8;
+  }
+  if (base == DXP_FONT_SERIF) {
+    if (bold && italic) { return 7; }
+    if (bold) { return 5; }
+    if (italic) { return 6; }
+    return 4;
+  }
+  if (bold && italic) { return 3; }
+  if (bold) { return 1; }
+  if (italic) { return 2; }
+  return 0;
+}
+
+export fn dxp_font_pdf_name(id: int32) -> string {
+  switch (id) {
+    case 0: { return "Helvetica"; }
+    case 1: { return "Helvetica-Bold"; }
+    case 2: { return "Helvetica-Oblique"; }
+    case 3: { return "Helvetica-BoldOblique"; }
+    case 4: { return "Times-Roman"; }
+    case 5: { return "Times-Bold"; }
+    case 6: { return "Times-Italic"; }
+    case 7: { return "Times-BoldItalic"; }
+    case 8: { return "Courier"; }
+    case 9: { return "Courier-Bold"; }
+    case 10: { return "Courier-Oblique"; }
+    case 11: { return "Courier-BoldOblique"; }
+    default: { return "Helvetica"; }
+  }
+}
+
+export fn dxp_font_is_serif(id: int32) -> bool {
+  return id >= 4 && id <= 7;
+}
+
+export fn dxp_font_is_mono(id: int32) -> bool {
+  return id >= 8;
+}
+
+export fn dxp_font_bold(id: int32) -> bool { return dxp_font_is_bold(id); }
+export fn dxp_font_italic(id: int32) -> bool { return dxp_font_is_italic(id); }
+
+fn dxp_width_unit(id: int32, b: uint8) -> int32 {
+  if (b >= 32 && b <= 126) {
+    var idx: int64 = (int64)b - 32;
+    if (dxp_font_is_mono(id)) { return 600; }
+    if (dxp_font_is_serif(id)) { return DXP_TIMES[idx]; }
+    return DXP_HELV[idx];
+  }
+  if (dxp_font_is_mono(id)) { return 600; }
+  if (dxp_font_is_serif(id)) { return 500; }
+  return 556;
+}
+
+// Decode one UTF-8 sequence. Returns the number of bytes consumed (at least
+// one) and stores the code point in *cp.
+export fn dxp_utf8_next(s: string, pos: int64, cp: uint32*) -> int64 {
+  if (pos < 0 || pos >= (int64)s.length) {
+    *cp = 0;
+    return 0;
+  }
+  var c0: uint8 = s.chars[pos];
+  if (c0 < 128) {
+    *cp = (uint32)c0;
+    return 1;
+  }
+  if ((c0 & 224) == 192 && pos + 1 < (int64)s.length) {
+    *cp = ((uint32)(c0 & 31) << 6) | (uint32)(s.chars[pos + 1] & 63);
+    return 2;
+  }
+  if ((c0 & 240) == 224 && pos + 2 < (int64)s.length) {
+    *cp = ((uint32)(c0 & 15) << 12) |
+          ((uint32)(s.chars[pos + 1] & 63) << 6) |
+          (uint32)(s.chars[pos + 2] & 63);
+    return 3;
+  }
+  if ((c0 & 248) == 240 && pos + 3 < (int64)s.length) {
+    *cp = ((uint32)(c0 & 7) << 18) |
+          ((uint32)(s.chars[pos + 1] & 63) << 12) |
+          ((uint32)(s.chars[pos + 2] & 63) << 6) |
+          (uint32)(s.chars[pos + 3] & 63);
+    return 4;
+  }
+  *cp = 63;
+  return 1;
+}
+
+// Unicode to a single WinAnsi byte. Unrepresentable characters become '?'.
+export fn dxp_winansi(cp: uint32) -> uint8 {
+  if (cp < 128) { return (uint8)cp; }
+  if (cp >= 160 && cp <= 255) { return (uint8)cp; }
+  switch (cp) {
+    case 0x20AC: { return 128; } // euro
+    case 0x201A: { return 130; }
+    case 0x0192: { return 131; }
+    case 0x201E: { return 132; }
+    case 0x2026: { return 133; } // ellipsis
+    case 0x2020: { return 134; }
+    case 0x2021: { return 135; }
+    case 0x02C6: { return 136; }
+    case 0x2030: { return 137; }
+    case 0x0160: { return 138; }
+    case 0x2039: { return 139; }
+    case 0x0152: { return 140; }
+    case 0x017D: { return 142; }
+    case 0x2018: { return 145; } // left single quote
+    case 0x2019: { return 146; } // right single quote
+    case 0x201C: { return 147; } // left double quote
+    case 0x201D: { return 148; } // right double quote
+    case 0x2022: { return 149; } // bullet
+    case 0x2013: { return 150; } // en dash
+    case 0x2014: { return 151; } // em dash
+    case 0x02DC: { return 152; }
+    case 0x2122: { return 153; } // trademark
+    case 0x0161: { return 154; }
+    case 0x203A: { return 155; }
+    case 0x0153: { return 156; }
+    case 0x017E: { return 158; }
+    case 0x0178: { return 159; }
+    case 0x2212: { return 45; }  // minus sign
+    case 0x00A0: { return 32; }  // no-break space
+    case 0x200B: { return 32; }  // zero-width space
+    case 0x200C: { return 32; }
+    case 0x200D: { return 32; }
+    case 0xFEFF: { return 32; }
+    case 0x2192: { return 62; }
+    case 0x2190: { return 60; }
+    case 0x2024: { return 46; }
+    default: { return 63; }
+  }
+}
+
+// Width of a UTF-8 string in points.
+export fn dxp_text_width(s: string, size: float64, font_id: int32) -> float64 {
+  var total: int64 = 0;
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    var cp: uint32 = 0;
+    var n: int64 = dxp_utf8_next(s, i, &cp);
+    if (n <= 0) { break; }
+    var b: uint8 = dxp_winansi(cp);
+    total = total + (int64)dxp_width_unit(font_id, b);
+    i = i + n;
+  }
+  return (float64)total * size / 1000.0;
+}
+
+// One-byte WinAnsi width.
+export fn dxp_byte_width(b: uint8, size: float64, font_id: int32) -> float64 {
+  return (float64)dxp_width_unit(font_id, b) * size / 1000.0;
+}
+
+// Append a PDF literal string containing the text in WinAnsi.
+export fn dxp_pdf_escape(out: DxpBuf*, s: string) {
+  dxp_buf_put(out, (uint8)'(');
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    var cp: uint32 = 0;
+    var n: int64 = dxp_utf8_next(s, i, &cp);
+    if (n <= 0) { break; }
+    var b: uint8 = dxp_winansi(cp);
+    if (b == '(' || b == ')' || b == '\\') {
+      dxp_buf_put(out, (uint8)'\\');
+      dxp_buf_put(out, b);
+    } else if (b == 10) {
+      dxp_buf_put(out, (uint8)'\\');
+      dxp_buf_put(out, (uint8)'n');
+    } else if (b == 13) {
+      dxp_buf_put(out, (uint8)'\\');
+      dxp_buf_put(out, (uint8)'r');
+    } else if (b < 32) {
+      dxp_buf_put(out, (uint8)'\\');
+      dxp_buf_put(out, (uint8)(48 + (b >> 6)));
+      dxp_buf_put(out, (uint8)(48 + ((b >> 3) & 7)));
+      dxp_buf_put(out, (uint8)(48 + (b & 7)));
+    } else {
+      dxp_buf_put(out, b);
+    }
+    i = i + n;
+  }
+  dxp_buf_put(out, (uint8)')');
+}
+
+// True when the text is entirely representable without transliteration.
+export fn dxp_text_is_winansi(s: string) -> bool {
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    var cp: uint32 = 0;
+    var n: int64 = dxp_utf8_next(s, i, &cp);
+    if (n <= 0) { return true; }
+    if (cp >= 128) {
+      var b: uint8 = dxp_winansi(cp);
+      if (b == 63 && cp != 63) { return false; }
+    }
+    i = i + n;
+  }
+  return true;
+}

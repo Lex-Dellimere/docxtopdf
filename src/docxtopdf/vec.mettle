@@ -1,0 +1,54 @@
+// A plain growable array. Unlike std/collections List it has no destructor:
+// values are copied in and the array is freed explicitly. This keeps the
+// converter's trees easy to walk and avoids ownership moves out of fields.
+
+import "std/mem";
+
+export struct DxpVec<T> {
+  data: T*;
+  length: int64;
+  capacity: int64;
+}
+
+export fn dxp_vec_init<T>() -> DxpVec<T> {
+  var v: DxpVec<T>;
+  v.data = 0;
+  v.length = 0;
+  v.capacity = 0;
+  return v;
+}
+
+export fn dxp_vec_reserve<T>(v: DxpVec<T>*, need: int64) -> int32 {
+  if (need <= v->capacity) { return 0; }
+  var cap: int64 = v->capacity;
+  if (cap < 8) { cap = 8; }
+  while (cap < need) { cap = cap * 2; }
+  var p: T* = (T*)realloc(v->data, cap * sizeof(T));
+  if (p == 0) { return -1; }
+  v->data = p;
+  v->capacity = cap;
+  return 0;
+}
+
+export fn dxp_vec_push<T>(v: DxpVec<T>*, value: T) -> int32 {
+  if (dxp_vec_reserve<T>(v, v->length + 1) != 0) { return -1; }
+  memcpy((cstring)&v->data[v->length], (cstring)&value, sizeof(T));
+  v->length = v->length + 1;
+  return 0;
+}
+
+export fn dxp_vec_get<T>(v: DxpVec<T>*, index: int64) -> T* {
+  if (index < 0 || index >= v->length) { return 0; }
+  return &v->data[index];
+}
+
+export fn dxp_vec_clear<T>(v: DxpVec<T>*) {
+  v->length = 0;
+}
+
+export fn dxp_vec_free<T>(v: DxpVec<T>*) {
+  if (v->data != 0) { free(v->data); }
+  v->data = 0;
+  v->length = 0;
+  v->capacity = 0;
+}

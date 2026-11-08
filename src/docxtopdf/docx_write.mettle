@@ -1,0 +1,421 @@
+// Write the document model as a minimal, valid .docx package.
+//
+// The package contains only what Word and LibreOffice need: content types,
+// package and document relationships, styles, core/app properties and the
+// main document part. Zip compression comes from Press through zip.mettle.
+
+import "std/mem";
+import "buf";
+import "vec";
+import "model";
+import "zip";
+
+fn dxp_docx_twips(pt: float64) -> int64 {
+  var v: float64 = pt * 20.0;
+  if (v < 0.0) { v = -v; }
+  return (int64)(v + 0.5);
+}
+
+fn dxp_docx_utf8_ok(s: string, i: int64, n: int64) -> bool {
+  if (i + n > (int64)s.length) { return false; }
+  if (n == 2) { return (s.chars[i + 1] & 192) == 128; }
+  if (n == 3) {
+    if ((s.chars[i + 1] & 192) != 128 || (s.chars[i + 2] & 192) != 128) { return false; }
+    var cp: uint32 = ((uint32)(s.chars[i] & 15) << 12) |
+                     ((uint32)(s.chars[i + 1] & 63) << 6) |
+                     (uint32)(s.chars[i + 2] & 63);
+    if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) { return false; }
+    if (cp == 0xFFFE || cp == 0xFFFF || (cp >= 0xFDD0 && cp <= 0xFDEF)) { return false; }
+    return true;
+  }
+  if (n == 4) {
+    if ((s.chars[i + 1] & 192) != 128 || (s.chars[i + 2] & 192) != 128 ||
+        (s.chars[i + 3] & 192) != 128) { return false; }
+    var cp4: uint32 = ((uint32)(s.chars[i] & 7) << 18) |
+                      ((uint32)(s.chars[i + 1] & 63) << 12) |
+                      ((uint32)(s.chars[i + 2] & 63) << 6) |
+                      (uint32)(s.chars[i + 3] & 63);
+    if (cp4 < 0x10000 || cp4 > 0x10FFFF) { return false; }
+    if ((cp4 & 0xFFFF) == 0xFFFE || (cp4 & 0xFFFF) == 0xFFFF) { return false; }
+    return true;
+  }
+  return false;
+}
+
+fn dxp_docx_escape(out: DxpBuf*, s: string) {
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    var c: uint8 = s.chars[i];
+    if (c == '&') { dxp_buf_puts(out, "&amp;"); i = i + 1; }
+    else if (c == '<') { dxp_buf_puts(out, "&lt;"); i = i + 1; }
+    else if (c == '>') { dxp_buf_puts(out, "&gt;"); i = i + 1; }
+    else if (c == '"') { dxp_buf_puts(out, "&quot;"); i = i + 1; }
+    else if (c == 9) { dxp_buf_put(out, 9); i = i + 1; }
+    else if (c == 10) { dxp_buf_puts(out, " "); i = i + 1; }
+    else if (c < 32) { i = i + 1; }
+    else if (c < 128) { dxp_buf_put(out, c); i = i + 1; }
+    else {
+      var n: int64 = 0;
+      if ((c & 224) == 192) { n = 2; }
+      else if ((c & 240) == 224) { n = 3; }
+      else if ((c & 248) == 240) { n = 4; }
+      if (n > 0 && dxp_docx_utf8_ok(s, i, n)) {
+        dxp_buf_append(out, s.chars + i, n);
+        i = i + n;
+      } else {
+        dxp_buf_put(out, (uint8)'?');
+        i = i + 1;
+      }
+    }
+  }
+}
+
+fn dxp_docx_font_name(font: int32) -> string {
+  if (font == DXP_FONT_SERIF) { return "Cambria"; }
+  if (font == DXP_FONT_MONO) { return "Consolas"; }
+  return "Calibri";
+}
+
+fn dxp_docx_has_edge_space(s: string) -> bool {
+  if (s.length == 0) { return false; }
+  if (s.chars[0] == ' ' || s.chars[(int64)s.length - 1] == ' ') { return true; }
+  return false;
+}
+
+fn dxp_docx_run(out: DxpBuf*, r: DxpRun*, fallback_size: float64) {
+  if (r->image != 0 || r->text.length == 0) { return; }
+  var size: float64 = r->size;
+  if (size <= 0.0) { size = fallback_size; }
+  if (size <= 0.0) { size = 11.0; }
+  dxp_buf_puts(out, "<w:r><w:rPr>");
+  dxp_buf_puts(out, "<w:rFonts w:ascii=\"");
+  dxp_buf_puts(out, dxp_docx_font_name(r->font));
+  dxp_buf_puts(out, "\" w:hAnsi=\"");
+  dxp_buf_puts(out, dxp_docx_font_name(r->font));
+  dxp_buf_puts(out, "\"/>");
+  if (r->bold) { dxp_buf_puts(out, "<w:b/>"); }
+  if (r->italic) { dxp_buf_puts(out, "<w:i/>"); }
+  if (r->underline) { dxp_buf_puts(out, "<w:u w:val=\"single\"/>"); }
+  if (r->strike) { dxp_buf_puts(out, "<w:strike/>"); }
+  if (r->color != 0) {
+    dxp_buf_puts(out, "<w:color w:val=\"");
+    var digits: uint8[16] = [48,49,50,51,52,53,54,55,56,57,65,66,67,68,69,70];
+    var sh: int32 = 20;
+    while (sh >= 0) {
+      var nib: uint32 = (r->color >> (uint32)sh) & 15;
+      dxp_buf_put(out, digits[(int64)nib]);
+      sh = sh - 4;
+    }
+    dxp_buf_puts(out, "\"/>");
+  }
+  dxp_buf_puts(out, "<w:sz w:val=\"");
+  dxp_buf_put_i64(out, dxp_docx_twips(size) / 10);
+  dxp_buf_puts(out, "\"/></w:rPr>");
+  var preserve: bool = dxp_docx_has_edge_space(r->text);
+  if (preserve) { dxp_buf_puts(out, "<w:t xml:space=\"preserve\">"); }
+  else { dxp_buf_puts(out, "<w:t>"); }
+  dxp_docx_escape(out, r->text);
+  dxp_buf_puts(out, "</w:t></w:r>");
+}
+
+fn dxp_docx_para(out: DxpBuf*, p: DxpParagraph*) {
+  dxp_buf_puts(out, "<w:p><w:pPr>");
+  if (p->heading > 0) {
+    dxp_buf_puts(out, "<w:pStyle w:val=\"Heading");
+    dxp_buf_put_i64(out, (int64)p->heading);
+    dxp_buf_puts(out, "\"/>");
+  }
+  if (p->align == DXP_ALIGN_CENTER) { dxp_buf_puts(out, "<w:jc w:val=\"center\"/>"); }
+  else if (p->align == DXP_ALIGN_RIGHT) { dxp_buf_puts(out, "<w:jc w:val=\"right\"/>"); }
+  else if (p->align == DXP_ALIGN_JUSTIFY) { dxp_buf_puts(out, "<w:jc w:val=\"both\"/>"); }
+  if (p->page_break_before) { dxp_buf_puts(out, "<w:pageBreakBefore/>"); }
+  if (p->space_before > 0.0) {
+    dxp_buf_puts(out, "<w:spacing w:before=\"");
+    dxp_buf_put_i64(out, dxp_docx_twips(p->space_before));
+    dxp_buf_puts(out, "\"");
+    if (p->space_after > 0.0) {
+      dxp_buf_puts(out, " w:after=\"");
+      dxp_buf_put_i64(out, dxp_docx_twips(p->space_after));
+      dxp_buf_puts(out, "\"");
+    }
+    if (p->line_spacing > 0.0) {
+      dxp_buf_puts(out, " w:line=\"");
+      dxp_buf_put_i64(out, (int64)(p->line_spacing * 240.0 + 0.5));
+      dxp_buf_puts(out, "\" w:lineRule=\"auto\"");
+    }
+    dxp_buf_puts(out, "/>");
+  } else if (p->space_after > 0.0 || p->line_spacing > 0.0) {
+    dxp_buf_puts(out, "<w:spacing");
+    if (p->space_after > 0.0) {
+      dxp_buf_puts(out, " w:after=\"");
+      dxp_buf_put_i64(out, dxp_docx_twips(p->space_after));
+      dxp_buf_puts(out, "\"");
+    }
+    if (p->line_spacing > 0.0) {
+      dxp_buf_puts(out, " w:line=\"");
+      dxp_buf_put_i64(out, (int64)(p->line_spacing * 240.0 + 0.5));
+      dxp_buf_puts(out, "\" w:lineRule=\"auto\"");
+    }
+    dxp_buf_puts(out, "/>");
+  }
+  if (p->indent_left != 0.0 || p->indent_right != 0.0 || p->first_line != 0.0) {
+    dxp_buf_puts(out, "<w:ind");
+    if (p->indent_left != 0.0) {
+      dxp_buf_puts(out, " w:left=\"");
+      dxp_buf_put_i64(out, dxp_docx_twips(p->indent_left));
+      dxp_buf_puts(out, "\"");
+    }
+    if (p->indent_right != 0.0) {
+      dxp_buf_puts(out, " w:right=\"");
+      dxp_buf_put_i64(out, dxp_docx_twips(p->indent_right));
+      dxp_buf_puts(out, "\"");
+    }
+    if (p->first_line > 0.0) {
+      dxp_buf_puts(out, " w:firstLine=\"");
+      dxp_buf_put_i64(out, dxp_docx_twips(p->first_line));
+      dxp_buf_puts(out, "\"");
+    } else if (p->first_line < 0.0) {
+      dxp_buf_puts(out, " w:hanging=\"");
+      dxp_buf_put_i64(out, dxp_docx_twips(p->first_line));
+      dxp_buf_puts(out, "\"");
+    }
+    dxp_buf_puts(out, "/>");
+  }
+  dxp_buf_puts(out, "</w:pPr>");
+  if (p->list_prefix.length > 0) {
+    var r: DxpRun;
+    dxp_run_init(&r);
+    r.text = p->list_prefix;
+    r.size = p->size;
+    dxp_docx_run(out, &r, p->size);
+  }
+  for i in 0..p->runs.length {
+    dxp_docx_run(out, &p->runs.data[i], p->size);
+  }
+  dxp_buf_puts(out, "</w:p>");
+}
+
+fn dxp_docx_table(out: DxpBuf*, t: DxpTable*) {
+  if (t->rows.length == 0) { return; }
+  var cols: int64 = 0;
+  for i in 0..t->rows.length {
+    if (t->rows.data[i].cells.length > cols) { cols = t->rows.data[i].cells.length; }
+  }
+  if (cols <= 0) { return; }
+  var total: float64 = 0.0;
+  for i in 0..t->widths.length { total = total + t->widths.data[i]; }
+  if (total <= 0.0) { total = 6.5 * 72.0; }
+  dxp_buf_puts(out, "<w:tbl><w:tblPr><w:tblW w:w=\"");
+  dxp_buf_put_i64(out, dxp_docx_twips(total));
+  dxp_buf_puts(out, "\" w:type=\"dxa\"/><w:tblBorders>");
+  dxp_buf_puts(out, "<w:top w:val=\"single\" w:sz=\"4\" w:color=\"808080\"/>");
+  dxp_buf_puts(out, "<w:left w:val=\"single\" w:sz=\"4\" w:color=\"808080\"/>");
+  dxp_buf_puts(out, "<w:bottom w:val=\"single\" w:sz=\"4\" w:color=\"808080\"/>");
+  dxp_buf_puts(out, "<w:right w:val=\"single\" w:sz=\"4\" w:color=\"808080\"/>");
+  dxp_buf_puts(out, "<w:insideH w:val=\"single\" w:sz=\"4\" w:color=\"808080\"/>");
+  dxp_buf_puts(out, "<w:insideV w:val=\"single\" w:sz=\"4\" w:color=\"808080\"/>");
+  dxp_buf_puts(out, "</w:tblBorders></w:tblPr><w:tblGrid>");
+  for i in 0..cols {
+    var w: float64 = total / (float64)cols;
+    if (i < t->widths.length) { w = t->widths.data[i]; }
+    dxp_buf_puts(out, "<w:gridCol w:w=\"");
+    dxp_buf_put_i64(out, dxp_docx_twips(w));
+    dxp_buf_puts(out, "\"/>");
+  }
+  dxp_buf_puts(out, "</w:tblGrid>");
+  for ri in 0..t->rows.length {
+    var row: DxpTableRow* = &t->rows.data[ri];
+    dxp_buf_puts(out, "<w:tr>");
+    if (row->header) { dxp_buf_puts(out, "<w:trPr><w:tblHeader/></w:trPr>"); }
+    for ci in 0..row->cells.length {
+      var cell: DxpTableCell* = &row->cells.data[ci];
+      var cw: float64 = total / (float64)cols;
+      if (ci < t->widths.length) { cw = t->widths.data[ci]; }
+      if (cell->width > 0.0) { cw = cell->width; }
+      dxp_buf_puts(out, "<w:tc><w:tcPr><w:tcW w:w=\"");
+      dxp_buf_put_i64(out, dxp_docx_twips(cw));
+      dxp_buf_puts(out, "\" w:type=\"dxa\"/>");
+      if (cell->colspan > 1) {
+        dxp_buf_puts(out, "<w:gridSpan w:val=\"");
+        dxp_buf_put_i64(out, (int64)cell->colspan);
+        dxp_buf_puts(out, "\"/>");
+      }
+      if (cell->shade != 0) {
+        dxp_buf_puts(out, "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"");
+        var digits: uint8[16] = [48,49,50,51,52,53,54,55,56,57,65,66,67,68,69,70];
+        var sh: int32 = 20;
+        while (sh >= 0) {
+          var nib: uint32 = (cell->shade >> (uint32)sh) & 15;
+          dxp_buf_put(out, digits[(int64)nib]);
+          sh = sh - 4;
+        }
+        dxp_buf_puts(out, "\"/>");
+      }
+      dxp_buf_puts(out, "</w:tcPr>");
+      for bi in 0..cell->blocks.length {
+        var b: DxpBlock* = cell->blocks.data[bi];
+        if (b->kind == DXP_BLOCK_PARA) {
+          dxp_docx_para(out, &b->para);
+        } else if (b->kind == DXP_BLOCK_TABLE) {
+          dxp_docx_table(out, b->table);
+        }
+      }
+      if (cell->blocks.length == 0) { dxp_buf_puts(out, "<w:p/>"); }
+      dxp_buf_puts(out, "</w:tc>");
+    }
+    dxp_buf_puts(out, "</w:tr>");
+  }
+  dxp_buf_puts(out, "</w:tbl>");
+}
+
+fn dxp_docx_build_document(d: DxpDocument*, out: DxpBuf*) {
+  dxp_buf_puts(out, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+  dxp_buf_puts(out, "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><w:body>");
+  for i in 0..d->blocks.length {
+    var b: DxpBlock* = d->blocks.data[i];
+    if (b->kind == DXP_BLOCK_PARA) {
+      dxp_docx_para(out, &b->para);
+    } else if (b->kind == DXP_BLOCK_TABLE) {
+      dxp_docx_table(out, b->table);
+    } else if (b->kind == DXP_BLOCK_PAGEBREAK) {
+      dxp_buf_puts(out, "<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
+    } else if (b->kind == DXP_BLOCK_IMAGE) {
+      // Images are not round-tripped through this path; a paragraph keeps
+      // the document flow intact.
+      dxp_buf_puts(out, "<w:p/>");
+    }
+  }
+  dxp_buf_puts(out, "<w:sectPr><w:pgSz w:w=\"");
+  dxp_buf_put_i64(out, dxp_docx_twips(d->page_w));
+  dxp_buf_puts(out, "\" w:h=\"");
+  dxp_buf_put_i64(out, dxp_docx_twips(d->page_h));
+  dxp_buf_puts(out, "\"/><w:pgMar w:top=\"");
+  dxp_buf_put_i64(out, dxp_docx_twips(d->margin_t));
+  dxp_buf_puts(out, "\" w:right=\"");
+  dxp_buf_put_i64(out, dxp_docx_twips(d->margin_r));
+  dxp_buf_puts(out, "\" w:bottom=\"");
+  dxp_buf_put_i64(out, dxp_docx_twips(d->margin_b));
+  dxp_buf_puts(out, "\" w:left=\"");
+  dxp_buf_put_i64(out, dxp_docx_twips(d->margin_l));
+  dxp_buf_puts(out, "\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/></w:sectPr>");
+  dxp_buf_puts(out, "</w:body></w:document>\n");
+}
+
+fn dxp_docx_build_styles(out: DxpBuf*) {
+  dxp_buf_puts(out, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+  dxp_buf_puts(out, "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">");
+  dxp_buf_puts(out, "<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii=\"Calibri\" w:hAnsi=\"Calibri\"/><w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/></w:rPr></w:rPrDefault><w:pPrDefault/></w:docDefaults>");
+  dxp_buf_puts(out, "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:qFormat/></w:style>");
+  var level: int32 = 1;
+  while (level <= 6) {
+    dxp_buf_puts(out, "<w:style w:type=\"paragraph\" w:styleId=\"Heading");
+    dxp_buf_put_i64(out, (int64)level);
+    dxp_buf_puts(out, "\"><w:name w:val=\"heading ");
+    dxp_buf_put_i64(out, (int64)level);
+    dxp_buf_puts(out, "\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before=\"240\" w:after=\"120\"/><w:outlineLvl w:val=\"");
+    dxp_buf_put_i64(out, (int64)(level - 1));
+    dxp_buf_puts(out, "\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"");
+    var sz: int32 = 32;
+    if (level == 2) { sz = 28; }
+    else if (level == 3) { sz = 24; }
+    else if (level >= 4) { sz = 22; }
+    dxp_buf_put_i64(out, (int64)sz);
+    dxp_buf_puts(out, "\"/><w:szCs w:val=\"");
+    dxp_buf_put_i64(out, (int64)sz);
+    dxp_buf_puts(out, "\"/></w:rPr></w:style>");
+    level = level + 1;
+  }
+  dxp_buf_puts(out, "</w:styles>\n");
+}
+
+fn dxp_docx_build_content_types(out: DxpBuf*) {
+  dxp_buf_puts(out, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+  dxp_buf_puts(out, "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">");
+  dxp_buf_puts(out, "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>");
+  dxp_buf_puts(out, "<Default Extension=\"xml\" ContentType=\"application/xml\"/>");
+  dxp_buf_puts(out, "<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>");
+  dxp_buf_puts(out, "<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>");
+  dxp_buf_puts(out, "<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>");
+  dxp_buf_puts(out, "<Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>");
+  dxp_buf_puts(out, "</Types>\n");
+}
+
+fn dxp_docx_build_root_rels(out: DxpBuf*) {
+  dxp_buf_puts(out, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+  dxp_buf_puts(out, "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+  dxp_buf_puts(out, "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>");
+  dxp_buf_puts(out, "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>");
+  dxp_buf_puts(out, "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>");
+  dxp_buf_puts(out, "</Relationships>\n");
+}
+
+fn dxp_docx_build_doc_rels(out: DxpBuf*) {
+  dxp_buf_puts(out, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+  dxp_buf_puts(out, "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
+  dxp_buf_puts(out, "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>");
+  dxp_buf_puts(out, "</Relationships>\n");
+}
+
+fn dxp_docx_build_core(d: DxpDocument*, out: DxpBuf*) {
+  dxp_buf_puts(out, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+  dxp_buf_puts(out, "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">");
+  dxp_buf_puts(out, "<dc:title>");
+  dxp_docx_escape(out, d->title);
+  dxp_buf_puts(out, "</dc:title><dc:creator>");
+  dxp_docx_escape(out, d->author);
+  dxp_buf_puts(out, "</dc:creator><cp:lastModifiedBy>docxtopdf</cp:lastModifiedBy>");
+  dxp_buf_puts(out, "<dcterms:created xsi:type=\"dcterms:W3CDTF\">2024-01-01T00:00:00Z</dcterms:created>");
+  dxp_buf_puts(out, "<dcterms:modified xsi:type=\"dcterms:W3CDTF\">2024-01-01T00:00:00Z</dcterms:modified>");
+  dxp_buf_puts(out, "</cp:coreProperties>\n");
+}
+
+fn dxp_docx_build_app(out: DxpBuf*) {
+  dxp_buf_puts(out, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
+  dxp_buf_puts(out, "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\"><Application>docxtopdf</Application></Properties>\n");
+}
+
+export fn dxp_docx_write(d: DxpDocument*, out: DxpBuf*) -> int32 {
+  var document: DxpBuf;
+  var styles: DxpBuf;
+  var types: DxpBuf;
+  var root_rels: DxpBuf;
+  var doc_rels: DxpBuf;
+  var core: DxpBuf;
+  var app: DxpBuf;
+  dxp_buf_init(&document, 4096);
+  dxp_buf_init(&styles, 2048);
+  dxp_buf_init(&types, 1024);
+  dxp_buf_init(&root_rels, 1024);
+  dxp_buf_init(&doc_rels, 512);
+  dxp_buf_init(&core, 512);
+  dxp_buf_init(&app, 512);
+
+  dxp_docx_build_document(d, &document);
+  dxp_docx_build_styles(&styles);
+  dxp_docx_build_content_types(&types);
+  dxp_docx_build_root_rels(&root_rels);
+  dxp_docx_build_doc_rels(&doc_rels);
+  dxp_docx_build_core(d, &core);
+  dxp_docx_build_app(&app);
+
+  var z: DxpZipOut;
+  dxp_zip_out_init(&z);
+  dxp_zip_out_add(&z, "[Content_Types].xml", types.data, types.len);
+  dxp_zip_out_add(&z, "_rels/.rels", root_rels.data, root_rels.len);
+  dxp_zip_out_add(&z, "word/document.xml", document.data, document.len);
+  dxp_zip_out_add(&z, "word/styles.xml", styles.data, styles.len);
+  dxp_zip_out_add(&z, "word/_rels/document.xml.rels", doc_rels.data, doc_rels.len);
+  dxp_zip_out_add(&z, "docProps/core.xml", core.data, core.len);
+  dxp_zip_out_add(&z, "docProps/app.xml", app.data, app.len);
+  var rc: int32 = dxp_zip_out_finish(&z, out);
+  dxp_zip_out_free(&z);
+
+  dxp_buf_free(&document);
+  dxp_buf_free(&styles);
+  dxp_buf_free(&types);
+  dxp_buf_free(&root_rels);
+  dxp_buf_free(&doc_rels);
+  dxp_buf_free(&core);
+  dxp_buf_free(&app);
+  return rc;
+}

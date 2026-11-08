@@ -1,0 +1,176 @@
+// Growable byte buffer used by the converter.
+//
+// A zeroed DxpBuf is an empty buffer. Every append records failure in
+// `failed`; callers can check once at the end instead of after each byte.
+
+import "std/mem";
+import "std/conv";
+
+export struct DxpBuf {
+  data: uint8*;
+  len: int64;
+  cap: int64;
+  failed: int32;
+}
+
+export fn dxp_buf_init(b: DxpBuf*, cap: int64) -> int32 {
+  b->data = (uint8*)0;
+  b->len = 0;
+  b->cap = 0;
+  b->failed = 0;
+  if (cap <= 0) { return 0; }
+  b->data = (uint8*)malloc(cap);
+  if (b->data == 0) {
+    b->failed = 1;
+    return -1;
+  }
+  b->cap = cap;
+  return 0;
+}
+
+export fn dxp_buf_free(b: DxpBuf*) {
+  if (b->data != 0) { free(b->data); }
+  b->data = (uint8*)0;
+  b->len = 0;
+  b->cap = 0;
+  b->failed = 0;
+}
+
+export fn dxp_buf_clear(b: DxpBuf*) {
+  b->len = 0;
+  b->failed = 0;
+}
+
+export fn dxp_buf_reserve(b: DxpBuf*, extra: int64) -> int32 {
+  if (extra <= 0) { return 0; }
+  if (b->failed != 0) { return -1; }
+  var need: int64 = b->len + extra;
+  if (need <= b->cap) { return 0; }
+  var ncap: int64 = b->cap * 2;
+  if (ncap < 256) { ncap = 256; }
+  if (ncap < need) { ncap = need; }
+  var nd: uint8* = (uint8*)realloc(b->data, ncap);
+  if (nd == 0) {
+    b->failed = 1;
+    return -1;
+  }
+  b->data = nd;
+  b->cap = ncap;
+  return 0;
+}
+
+export fn dxp_buf_put(b: DxpBuf*, v: uint8) -> int32 {
+  if (dxp_buf_reserve(b, 1) != 0) { return -1; }
+  b->data[b->len] = v;
+  b->len = b->len + 1;
+  return 0;
+}
+
+export fn dxp_buf_append(b: DxpBuf*, p: uint8*, n: int64) -> int32 {
+  if (n <= 0) { return 0; }
+  if (p == 0) {
+    b->failed = 1;
+    return -1;
+  }
+  if (dxp_buf_reserve(b, n) != 0) { return -1; }
+  memcpy(b->data + b->len, p, n);
+  b->len = b->len + n;
+  return 0;
+}
+
+export fn dxp_buf_puts(b: DxpBuf*, s: string) -> int32 {
+  return dxp_buf_append(b, s.chars, (int64)s.length);
+}
+
+export fn dxp_buf_put_cstr(b: DxpBuf*, s: cstring) -> int32 {
+  if (s == 0) { return 0; }
+  var n: int64 = 0;
+  while (s[n] != 0) { n = n + 1; }
+  return dxp_buf_append(b, s, n);
+}
+
+export fn dxp_buf_put_i64(b: DxpBuf*, n: int64) -> int32 {
+  var tmp: uint8[32];
+  var s: string = i64_to_str(n, &tmp[0], 32);
+  return dxp_buf_puts(b, s);
+}
+
+export fn dxp_buf_put_f64(b: DxpBuf*, x: float64, decimals: int32) -> int32 {
+  // Mettle has no printf float formatter; interpolation is the stdlib one.
+  // Scale and print as an integer with a fixed number of decimal places.
+  var scale: float64 = 1.0;
+  var d: int32 = 0;
+  while (d < decimals) {
+    scale = scale * 10.0;
+    d = d + 1;
+  }
+  var neg: bool = x < 0.0;
+  if (neg) { x = -x; }
+  var scaled: int64 = (int64)(x * scale + 0.5);
+  if (decimals <= 0) {
+    if (neg) { dxp_buf_put(b, (uint8)'-'); }
+    return dxp_buf_put_i64(b, scaled);
+  }
+  var whole: int64 = scaled / (int64)scale;
+  var frac: int64 = scaled % (int64)scale;
+  if (neg && (whole != 0 || frac != 0)) { dxp_buf_put(b, (uint8)'-'); }
+  dxp_buf_put_i64(b, whole);
+  dxp_buf_put(b, (uint8)'.');
+  var div: int64 = (int64)scale / 10;
+  while (div > 0) {
+    var digit: int64 = (frac / div) % 10;
+    dxp_buf_put(b, (uint8)((int32)'0' + (int32)digit));
+    div = div / 10;
+  }
+  return 0;
+}
+
+export fn dxp_buf_put_hex32(b: DxpBuf*, v: uint32) -> int32 {
+  var digits: uint8[16] = [48,49,50,51,52,53,54,55,56,57,97,98,99,100,101,102];
+  var shift: int32 = 28;
+  while (shift >= 0) {
+    var nib: uint32 = (v >> (uint32)shift) & 15;
+    dxp_buf_put(b, digits[(int64)nib]);
+    shift = shift - 4;
+  }
+  return 0;
+}
+
+// Returns a borrowed view of the bytes. They are not NUL-terminated; use
+// dxp_buf_put(b, 0) first when a C string is needed.
+export fn dxp_buf_view(b: DxpBuf*) -> string {
+  var s: string;
+  s.chars = b->data;
+  s.length = (uint64)b->len;
+  return s;
+}
+
+// Adds a terminating NUL and returns the buffer as a C string.
+export fn dxp_buf_cstr(b: DxpBuf*) -> cstring {
+  dxp_buf_put(b, 0);
+  b->len = b->len - 1;
+  return (cstring)b->data;
+}
+
+// Copies the bytes into a fresh heap string (with a hidden NUL). The caller
+// owns s.chars and frees it.
+export fn dxp_buf_dup_string(b: DxpBuf*) -> string {
+  var n: int64 = b->len;
+  var p: uint8* = (uint8*)malloc(n + 1);
+  if (p == 0) {
+    var empty: string;
+    return empty;
+  }
+  if (n > 0) { memcpy(p, b->data, n); }
+  p[n] = 0;
+  var s: string;
+  s.chars = p;
+  s.length = (uint64)n;
+  return s;
+}
+
+export fn dxp_buf_set(b: DxpBuf*, p: uint8*, n: int64) -> int32 {
+  b->len = 0;
+  b->failed = 0;
+  return dxp_buf_append(b, p, n);
+}

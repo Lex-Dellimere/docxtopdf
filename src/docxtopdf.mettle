@@ -1,0 +1,14 @@
+// docxtopdf: DOCX <-> PDF conversion in pure Mettle.
+//
+// This facade re-exports the modules below. Every global name begins with
+// dxp_ or Dxp so it does not collide with the standard library or Press.
+import "docxtopdf/buf";
+import "docxtopdf/zip";
+import "docxtopdf/xml";
+import "docxtopdf/model";
+import "docxtopdf/font";
+import "docxtopdf/docx_read";
+import "docxtopdf/docx_write";
+import "docxtopdf/pdf_write";
+import "docxtopdf/pdf_read";
+import "docxtopdf/cli";

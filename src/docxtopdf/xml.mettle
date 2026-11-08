@@ -1,0 +1,413 @@
+// A small, forgiving XML reader for OOXML and similar documents.
+//
+// It builds a tree of elements with attributes and direct character data.
+// Strings are allocated in the caller's arena. Namespace prefixes are kept,
+// so `w:p` stays `w:p`; helpers also match by local name.
+
+import "std/mem";
+import "std/conv";
+import "vec";
+import "std/arena";
+import "buf";
+
+export struct DxpXmlAttr {
+  name: string;
+  value: string;
+}
+
+export struct DxpXmlNode {
+  name: string;
+  text: DxpBuf;
+  attrs: DxpVec<DxpXmlAttr>;
+  kids: DxpVec<DxpXmlNode*>;
+}
+
+struct DxpXmlParser {
+  data: uint8*;
+  len: int64;
+  pos: int64;
+  arena: Arena*;
+  err: int32;
+}
+
+fn dxp_arena_copy(a: Arena*, p: uint8*, n: int64) -> string {
+  var s: string;
+  if (a == 0 || p == 0 || n < 0) { return s; }
+  var q: uint8* = (uint8*)arena_alloc(a, n + 1);
+  if (q == 0) { return s; }
+  if (n > 0) { memcpy(q, p, n); }
+  q[n] = 0;
+  s.chars = q;
+  s.length = (uint64)n;
+  return s;
+}
+
+export fn dxp_str_dup_arena(a: Arena*, s: string) -> string {
+  return dxp_arena_copy(a, s.chars, (int64)s.length);
+}
+
+fn dxp_utf8_put(out: DxpBuf*, cp: uint32) {
+  if (cp < 128) {
+    dxp_buf_put(out, (uint8)cp);
+  } else if (cp < 2048) {
+    dxp_buf_put(out, (uint8)(192 + (cp >> 6)));
+    dxp_buf_put(out, (uint8)(128 + (cp & 63)));
+  } else if (cp < 65536) {
+    dxp_buf_put(out, (uint8)(224 + (cp >> 12)));
+    dxp_buf_put(out, (uint8)(128 + ((cp >> 6) & 63)));
+    dxp_buf_put(out, (uint8)(128 + (cp & 63)));
+  } else {
+    dxp_buf_put(out, (uint8)(240 + (cp >> 18)));
+    dxp_buf_put(out, (uint8)(128 + ((cp >> 12) & 63)));
+    dxp_buf_put(out, (uint8)(128 + ((cp >> 6) & 63)));
+    dxp_buf_put(out, (uint8)(128 + (cp & 63)));
+  }
+}
+
+// Decode the five predefined XML entities and numeric references.
+fn dxp_xml_entity(out: DxpBuf*, name: string) {
+  if (name == "amp") { dxp_buf_put(out, (uint8)'&'); return; }
+  if (name == "lt") { dxp_buf_put(out, (uint8)'<'); return; }
+  if (name == "gt") { dxp_buf_put(out, (uint8)'>'); return; }
+  if (name == "quot") { dxp_buf_put(out, (uint8)'"'); return; }
+  if (name == "apos") { dxp_buf_put(out, (uint8)'\''); return; }
+  if (name.length >= 2 && name.chars[0] == '#') {
+    var cp: uint32 = 0;
+    var i: int64 = 1;
+    var hex: bool = false;
+    if (name.chars[1] == 'x' || name.chars[1] == 'X') {
+      hex = true;
+      i = 2;
+    }
+    while (i < (int64)name.length) {
+      var c: uint8 = name.chars[i];
+      var d: uint32 = 0;
+      if (c >= '0' && c <= '9') { d = (uint32)(c - '0'); }
+      else if (hex && c >= 'a' && c <= 'f') { d = (uint32)(c - 'a' + 10); }
+      else if (hex && c >= 'A' && c <= 'F') { d = (uint32)(c - 'A' + 10); }
+      else { return; }
+      if (hex) { cp = cp * 16 + d; } else { cp = cp * 10 + d; }
+      i = i + 1;
+    }
+    dxp_utf8_put(out, cp);
+  }
+}
+
+// Copy [start,end) into out, decoding entities.
+fn dxp_xml_text_into(out: DxpBuf*, p: uint8*, start: int64, end: int64) {
+  var i: int64 = start;
+  while (i < end) {
+    if (p[i] == '&') {
+      var j: int64 = i + 1;
+      while (j < end && p[j] != ';') { j = j + 1; }
+      if (j < end) {
+        var ent: string;
+        ent.chars = p + i + 1;
+        ent.length = (uint64)(j - i - 1);
+        dxp_xml_entity(out, ent);
+        i = j + 1;
+      } else {
+        dxp_buf_put(out, p[i]);
+        i = i + 1;
+      }
+    } else {
+      dxp_buf_put(out, p[i]);
+      i = i + 1;
+    }
+  }
+}
+
+fn dxp_xml_skip_ws(x: DxpXmlParser*) {
+  while (x->pos < x->len) {
+    var c: uint8 = x->data[x->pos];
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+      x->pos = x->pos + 1;
+    } else {
+      return;
+    }
+  }
+}
+
+fn dxp_xml_name_end(x: DxpXmlParser*, start: int64) -> int64 {
+  var i: int64 = start;
+  while (i < x->len) {
+    var c: uint8 = x->data[i];
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+        c == '/' || c == '>' || c == '=') {
+      return i;
+    }
+    i = i + 1;
+  }
+  return i;
+}
+
+// Skip <?...?>, <!--...-->, and <!DOCTYPE ...>.
+fn dxp_xml_skip_misc(x: DxpXmlParser*) {
+  while (x->pos < x->len) {
+    var wc: uint8 = x->data[x->pos];
+    if (wc == ' ' || wc == '\t' || wc == '\r' || wc == '\n') {
+      x->pos = x->pos + 1;
+      continue;
+    }
+    if (wc != '<') { return; }
+    if (x->pos + 1 >= x->len) { return; }
+    var c: uint8 = x->data[x->pos + 1];
+    if (c == '?') {
+      x->pos = x->pos + 2;
+      while (x->pos + 1 < x->len) {
+        if (x->data[x->pos] == '?' && x->data[x->pos + 1] == '>') {
+          x->pos = x->pos + 2;
+          break;
+        }
+        x->pos = x->pos + 1;
+      }
+      continue;
+    }
+    if (c == '!') {
+      if (x->pos + 3 < x->len &&
+          x->data[x->pos + 2] == '-' && x->data[x->pos + 3] == '-') {
+        x->pos = x->pos + 4;
+        while (x->pos + 2 < x->len) {
+          if (x->data[x->pos] == '-' && x->data[x->pos + 1] == '-' &&
+              x->data[x->pos + 2] == '>') {
+            x->pos = x->pos + 3;
+            break;
+          }
+          x->pos = x->pos + 1;
+        }
+        continue;
+      }
+      // DOCTYPE or another declaration: skip to the matching '>'.
+      var depth: int32 = 0;
+      x->pos = x->pos + 2;
+      while (x->pos < x->len) {
+        var d: uint8 = x->data[x->pos];
+        if (d == '[') { depth = depth + 1; }
+        if (d == ']' && depth > 0) { depth = depth - 1; }
+        x->pos = x->pos + 1;
+        if (d == '>' && depth == 0) { break; }
+      }
+      continue;
+    }
+    return;
+  }
+}
+
+fn dxp_xml_parse_element(x: DxpXmlParser*) -> DxpXmlNode* {
+  if (x->pos >= x->len || x->data[x->pos] != '<') { return 0; }
+  x->pos = x->pos + 1;
+  var ns: int64 = x->pos;
+  var ne: int64 = dxp_xml_name_end(x, ns);
+  if (ne <= ns) {
+    x->err = 1;
+    return 0;
+  }
+  var node: DxpXmlNode* = new DxpXmlNode;
+  node->name = dxp_arena_copy(x->arena, x->data + ns, ne - ns);
+  x->pos = ne;
+
+  // Attributes.
+  while (x->pos < x->len) {
+    dxp_xml_skip_ws(x);
+    if (x->pos >= x->len) { x->err = 1; break; }
+    var c: uint8 = x->data[x->pos];
+    if (c == '>') {
+      x->pos = x->pos + 1;
+      break;
+    }
+    if (c == '/') {
+      x->pos = x->pos + 1;
+      if (x->pos < x->len && x->data[x->pos] == '>') { x->pos = x->pos + 1; }
+      return node;
+    }
+    var as: int64 = x->pos;
+    var ae: int64 = dxp_xml_name_end(x, as);
+    if (ae <= as) {
+      x->err = 1;
+      x->pos = x->pos + 1;
+      continue;
+    }
+    var aname: string = dxp_arena_copy(x->arena, x->data + as, ae - as);
+    x->pos = ae;
+    dxp_xml_skip_ws(x);
+    if (x->pos >= x->len || x->data[x->pos] != '=') { continue; }
+    x->pos = x->pos + 1;
+    dxp_xml_skip_ws(x);
+    if (x->pos >= x->len) { x->err = 1; break; }
+    var q: uint8 = x->data[x->pos];
+    if (q != '"' && q != '\'') { continue; }
+    x->pos = x->pos + 1;
+    var vs: int64 = x->pos;
+    while (x->pos < x->len && x->data[x->pos] != q) { x->pos = x->pos + 1; }
+    var ve: int64 = x->pos;
+    if (x->pos < x->len) { x->pos = x->pos + 1; }
+    var vb: DxpBuf;
+    dxp_xml_text_into(&vb, x->data, vs, ve);
+    var av: DxpXmlAttr;
+    av.name = aname;
+    av.value = dxp_arena_copy(x->arena, vb.data, vb.len);
+    dxp_buf_free(&vb);
+    dxp_vec_push<DxpXmlAttr>(&node->attrs, av);
+  }
+
+  // Children and text.
+  while (x->pos < x->len) {
+    if (x->data[x->pos] != '<') {
+      var ts: int64 = x->pos;
+      while (x->pos < x->len && x->data[x->pos] != '<') { x->pos = x->pos + 1; }
+      dxp_xml_text_into(&node->text, x->data, ts, x->pos);
+      continue;
+    }
+    if (x->pos + 1 >= x->len) { break; }
+    var c2: uint8 = x->data[x->pos + 1];
+    if (c2 == '/') {
+      x->pos = x->pos + 2;
+      while (x->pos < x->len && x->data[x->pos] != '>') { x->pos = x->pos + 1; }
+      if (x->pos < x->len) { x->pos = x->pos + 1; }
+      return node;
+    }
+    if (c2 == '!') {
+      if (x->pos + 8 < x->len && x->data[x->pos + 2] == '[' &&
+          x->data[x->pos + 3] == 'C' && x->data[x->pos + 4] == 'D' &&
+          x->data[x->pos + 5] == 'A' && x->data[x->pos + 6] == 'T' &&
+          x->data[x->pos + 7] == 'A' && x->data[x->pos + 8] == '[') {
+        x->pos = x->pos + 9;
+        var cs: int64 = x->pos;
+        while (x->pos + 2 < x->len) {
+          if (x->data[x->pos] == ']' && x->data[x->pos + 1] == ']' &&
+              x->data[x->pos + 2] == '>') {
+            dxp_buf_append(&node->text, x->data + cs, x->pos - cs);
+            x->pos = x->pos + 3;
+            break;
+          }
+          x->pos = x->pos + 1;
+        }
+        continue;
+      }
+      dxp_xml_skip_misc(x);
+      continue;
+    }
+    if (c2 == '?') {
+      dxp_xml_skip_misc(x);
+      continue;
+    }
+    var child: DxpXmlNode* = dxp_xml_parse_element(x);
+    if (child == 0) { break; }
+    dxp_vec_push<DxpXmlNode*>(&node->kids, child);
+  }
+  return node;
+}
+
+export fn dxp_xml_parse(data: uint8*, len: int64, arena: Arena*) -> DxpXmlNode* {
+  var x: DxpXmlParser;
+  x.data = data;
+  x.len = len;
+  x.pos = 0;
+  x.arena = arena;
+  x.err = 0;
+  if (len >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) {
+    x.pos = 3;
+  }
+  dxp_xml_skip_misc(&x);
+  if (x.pos >= x.len || x.data[x.pos] != '<') { return 0; }
+  var root: DxpXmlNode* = dxp_xml_parse_element(&x);
+  return root;
+}
+
+export fn dxp_xml_free(node: DxpXmlNode*) {
+  if (node == 0) { return; }
+  for i in 0..node->kids.length {
+    dxp_xml_free(node->kids.data[i]);
+  }
+  dxp_vec_free<DxpXmlNode*>(&node->kids);
+  dxp_vec_free<DxpXmlAttr>(&node->attrs);
+  dxp_buf_free(&node->text);
+  free(node);
+}
+
+fn dxp_name_local_start(name: string) -> int64 {
+  var i: int64 = 0;
+  while (i < (int64)name.length) {
+    if (name.chars[i] == ':') { return i + 1; }
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn dxp_name_local(name: string) -> string {
+  var start: int64 = dxp_name_local_start(name);
+  if (start == 0) { return name; }
+  var s: string;
+  s.chars = name.chars + start;
+  s.length = name.length - (uint64)start;
+  return s;
+}
+
+export fn dxp_xml_name_eq(node: DxpXmlNode*, name: string) -> bool {
+  if (node == 0) { return false; }
+  if (node->name == name) { return true; }
+  var local: string = dxp_name_local(node->name);
+  return local == name;
+}
+
+export fn dxp_xml_child(node: DxpXmlNode*, name: string) -> DxpXmlNode* {
+  if (node == 0) { return 0; }
+  for i in 0..node->kids.length {
+    var c: DxpXmlNode* = node->kids.data[i];
+    if (dxp_xml_name_eq(c, name)) { return c; }
+  }
+  return 0;
+}
+
+export fn dxp_xml_child_at(node: DxpXmlNode*, index: int64) -> DxpXmlNode* {
+  if (node == 0 || index < 0 || index >= node->kids.length) { return 0; }
+  return node->kids.data[index];
+}
+
+export fn dxp_xml_children_count(node: DxpXmlNode*) -> int64 {
+  if (node == 0) { return 0; }
+  return node->kids.length;
+}
+
+// First descendant (depth first) with this local name, excluding node itself.
+export fn dxp_xml_find(node: DxpXmlNode*, name: string) -> DxpXmlNode* {
+  if (node == 0) { return 0; }
+  for i in 0..node->kids.length {
+    var c: DxpXmlNode* = node->kids.data[i];
+    if (dxp_xml_name_eq(c, name)) { return c; }
+    var d: DxpXmlNode* = dxp_xml_find(c, name);
+    if (d != 0) { return d; }
+  }
+  return 0;
+}
+
+export fn dxp_xml_attr(node: DxpXmlNode*, name: string) -> string {
+  if (node == 0) { return ""; }
+  for i in 0..node->attrs.length {
+    var a: DxpXmlAttr = node->attrs.data[i];
+    if (a.name == name) { return a.value; }
+    var local: string = dxp_name_local(a.name);
+    if (local == name) { return a.value; }
+  }
+  return "";
+}
+
+export fn dxp_xml_attr_int(node: DxpXmlNode*, name: string) -> int64 {
+  var s: string = dxp_xml_attr(node, name);
+  if (s.length == 0) { return 0; }
+  return str_to_i64_or(s, 0);
+}
+
+export fn dxp_xml_attr_bool(node: DxpXmlNode*, name: string, fallback: bool) -> bool {
+  var s: string = dxp_xml_attr(node, name);
+  if (s.length == 0) { return fallback; }
+  if (s == "1" || s == "true" || s == "on" || s == "yes") { return true; }
+  if (s == "0" || s == "false" || s == "off" || s == "no") { return false; }
+  return fallback;
+}
+
+// Direct text of an element (entity-decoded, without descendant text).
+export fn dxp_xml_text(node: DxpXmlNode*) -> string {
+  if (node == 0) { return ""; }
+  return dxp_buf_view(&node->text);
+}

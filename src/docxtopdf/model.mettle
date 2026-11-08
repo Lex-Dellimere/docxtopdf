@@ -1,0 +1,288 @@
+// The document model shared by the DOCX reader, PDF reader and both writers.
+//
+// Text strings in the model are owned by the conversion arena. Image bytes
+// are malloc'd copies and are released by dxp_doc_free.
+
+import "std/mem";
+import "vec";
+
+export const DXP_ALIGN_LEFT: int32 = 0;
+export const DXP_ALIGN_CENTER: int32 = 1;
+export const DXP_ALIGN_RIGHT: int32 = 2;
+export const DXP_ALIGN_JUSTIFY: int32 = 3;
+
+export const DXP_FONT_SANS: int32 = 0;
+export const DXP_FONT_SERIF: int32 = 1;
+export const DXP_FONT_MONO: int32 = 2;
+
+export const DXP_IMG_JPEG: int32 = 1;
+export const DXP_IMG_PNG: int32 = 2;
+
+export const DXP_BLOCK_PARA: int32 = 1;
+export const DXP_BLOCK_TABLE: int32 = 2;
+export const DXP_BLOCK_IMAGE: int32 = 3;
+export const DXP_BLOCK_PAGEBREAK: int32 = 4;
+
+export struct DxpImage {
+  data: uint8*;
+  len: int64;
+  kind: int32;
+  width: float64;      // points
+  height: float64;     // points
+  src_name: string;    // original media path, for diagnostics
+}
+
+export struct DxpRun {
+  text: string;
+  font: int32;
+  bold: bool;
+  italic: bool;
+  underline: bool;
+  strike: bool;
+  size: float64;
+  color: uint32;
+  image: DxpImage*;
+}
+
+export struct DxpParagraph {
+  runs: DxpVec<DxpRun>;
+  align: int32;
+  style_name: string;
+  heading: int32;
+  size: float64;
+  color: uint32;
+  space_before: float64;
+  space_after: float64;
+  line_spacing: float64;
+  indent_left: float64;
+  indent_right: float64;
+  first_line: float64;
+  list_prefix: string;
+  list_level: int32;
+  page_break_before: bool;
+  page_break_after: bool;
+  keep_together: bool;
+}
+
+export struct DxpTableCell {
+  blocks: DxpVec<DxpBlock*>;
+  colspan: int32;
+  rowspan: int32;
+  width: float64;
+  shade: uint32;
+}
+
+export struct DxpTableRow {
+  cells: DxpVec<DxpTableCell>;
+  header: bool;
+}
+
+export struct DxpTable {
+  rows: DxpVec<DxpTableRow>;
+  widths: DxpVec<float64>;
+  border: uint32;
+  cell_pad: float64;
+}
+
+export struct DxpBlock {
+  kind: int32;
+  para: DxpParagraph;
+  table: DxpTable*;
+  image: DxpImage*;
+}
+
+export struct DxpDocument {
+  blocks: DxpVec<DxpBlock*>;
+  page_w: float64;
+  page_h: float64;
+  margin_l: float64;
+  margin_r: float64;
+  margin_t: float64;
+  margin_b: float64;
+  default_size: float64;
+  default_font: int32;
+  title: string;
+  author: string;
+}
+
+export fn dxp_doc_init(d: DxpDocument*) {
+  d->blocks = dxp_vec_init<DxpBlock*>();
+  d->page_w = 612.0;
+  d->page_h = 792.0;
+  d->margin_l = 72.0;
+  d->margin_r = 72.0;
+  d->margin_t = 72.0;
+  d->margin_b = 72.0;
+  d->default_size = 11.0;
+  d->default_font = DXP_FONT_SANS;
+  d->title = "";
+  d->author = "";
+}
+
+export fn dxp_para_init(p: DxpParagraph*) {
+  p->runs = dxp_vec_init<DxpRun>();
+  p->align = DXP_ALIGN_LEFT;
+  p->style_name = "";
+  p->heading = 0;
+  p->size = 0.0;
+  p->color = 0;
+  p->space_before = 0.0;
+  p->space_after = 0.0;
+  p->line_spacing = 0.0;
+  p->indent_left = 0.0;
+  p->indent_right = 0.0;
+  p->first_line = 0.0;
+  p->list_prefix = "";
+  p->list_level = 0;
+  p->page_break_before = false;
+  p->page_break_after = false;
+  p->keep_together = false;
+}
+
+export fn dxp_run_init(r: DxpRun*) {
+  r->text = "";
+  r->font = DXP_FONT_SANS;
+  r->bold = false;
+  r->italic = false;
+  r->underline = false;
+  r->strike = false;
+  r->size = 0.0;
+  r->color = 0;
+  r->image = 0;
+}
+
+export fn dxp_block_new(kind: int32) -> DxpBlock* {
+  var b: DxpBlock* = new DxpBlock;
+  b->kind = kind;
+  dxp_para_init(&b->para);
+  b->table = 0;
+  b->image = 0;
+  return b;
+}
+
+export fn dxp_doc_add_para(d: DxpDocument*, p: DxpParagraph) -> DxpBlock* {
+  var b: DxpBlock* = dxp_block_new(DXP_BLOCK_PARA);
+  b->para = p;
+  dxp_vec_push<DxpBlock*>(&d->blocks, b);
+  return b;
+}
+
+export fn dxp_doc_add_block(d: DxpDocument*, b: DxpBlock*) {
+  dxp_vec_push<DxpBlock*>(&d->blocks, b);
+}
+
+export fn dxp_doc_add_table(d: DxpDocument*, t: DxpTable*) -> DxpBlock* {
+  var b: DxpBlock* = dxp_block_new(DXP_BLOCK_TABLE);
+  b->table = t;
+  dxp_vec_push<DxpBlock*>(&d->blocks, b);
+  return b;
+}
+
+export fn dxp_doc_add_pagebreak(d: DxpDocument*) {
+  var b: DxpBlock* = dxp_block_new(DXP_BLOCK_PAGEBREAK);
+  dxp_vec_push<DxpBlock*>(&d->blocks, b);
+}
+
+export fn dxp_table_new() -> DxpTable* {
+  var t: DxpTable* = new DxpTable;
+  t->rows = dxp_vec_init<DxpTableRow>();
+  t->widths = dxp_vec_init<float64>();
+  t->border = 0x808080;
+  t->cell_pad = 4.0;
+  return t;
+}
+
+export fn dxp_table_add_row(t: DxpTable*, header: bool) -> DxpTableRow* {
+  var r: DxpTableRow;
+  r.cells = dxp_vec_init<DxpTableCell>();
+  r.header = header;
+  dxp_vec_push<DxpTableRow>(&t->rows, r);
+  return &t->rows.data[t->rows.length - 1];
+}
+
+export fn dxp_row_add_cell(r: DxpTableRow*) -> DxpTableCell* {
+  var c: DxpTableCell;
+  c.blocks = dxp_vec_init<DxpBlock*>();
+  c.colspan = 1;
+  c.rowspan = 1;
+  c.width = 0.0;
+  c.shade = 0;
+  dxp_vec_push<DxpTableCell>(&r->cells, c);
+  return &r->cells.data[r->cells.length - 1];
+}
+
+fn dxp_free_para(p: DxpParagraph*) {
+  for i in 0..p->runs.length {
+    var r: DxpRun* = &p->runs.data[i];
+    if (r->image != 0) {
+      if (r->image->data != 0) { free(r->image->data); }
+      free(r->image);
+    }
+  }
+  dxp_vec_free<DxpRun>(&p->runs);
+}
+
+fn dxp_free_block(b: DxpBlock*) {
+  if (b == 0) { return; }
+  if (b->kind == DXP_BLOCK_PARA) {
+    dxp_free_para(&b->para);
+  } else if (b->kind == DXP_BLOCK_TABLE && b->table != 0) {
+    for i in 0..b->table->rows.length {
+      var row: DxpTableRow* = &b->table->rows.data[i];
+      for j in 0..row->cells.length {
+        var cell: DxpTableCell* = &row->cells.data[j];
+        for k in 0..cell->blocks.length {
+          dxp_free_block(cell->blocks.data[k]);
+        }
+        dxp_vec_free<DxpBlock*>(&cell->blocks);
+      }
+      dxp_vec_free<DxpTableCell>(&row->cells);
+    }
+    dxp_vec_free<DxpTableRow>(&b->table->rows);
+    dxp_vec_free<float64>(&b->table->widths);
+    free(b->table);
+  } else if (b->kind == DXP_BLOCK_IMAGE && b->image != 0) {
+    if (b->image->data != 0) { free(b->image->data); }
+    free(b->image);
+  }
+  free(b);
+}
+
+export fn dxp_doc_free(d: DxpDocument*) {
+  for i in 0..d->blocks.length {
+    dxp_free_block(d->blocks.data[i]);
+  }
+  dxp_vec_free<DxpBlock*>(&d->blocks);
+}
+
+export fn dxp_para_add_text(p: DxpParagraph*, text: string, size: float64,
+                            font: int32, bold: bool, italic: bool,
+                            underline: bool, color: uint32) {
+  var r: DxpRun;
+  dxp_run_init(&r);
+  r.text = text;
+  r.size = size;
+  r.font = font;
+  r.bold = bold;
+  r.italic = italic;
+  r.underline = underline;
+  r.color = color;
+  dxp_vec_push<DxpRun>(&p->runs, r);
+}
+
+export fn dxp_text_len(p: DxpParagraph*) -> int64 {
+  var n: int64 = 0;
+  for i in 0..p->runs.length {
+    n = n + (int64)p->runs.data[i].text.length;
+  }
+  return n;
+}
+
+export fn dxp_para_is_empty(p: DxpParagraph*) -> bool {
+  for i in 0..p->runs.length {
+    var r: DxpRun = p->runs.data[i];
+    if (r.image != 0) { return false; }
+    if (r.text.length != 0) { return false; }
+  }
+  return true;
+}

@@ -1,0 +1,6 @@
+import "std/io";
+import "docxtopdf/docxtopdf";
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  return dxp_main(argc, argv);
+}

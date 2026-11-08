@@ -1,0 +1,1162 @@
+// Read a .docx package into the shared document model.
+//
+// Handles paragraphs, styles, lists, tables, inline images, page setup and
+// the common character formatting. Unknown OOXML elements are ignored, so a
+// document never fails to convert merely because it uses a newer feature.
+
+import "std/mem";
+import "std/conv";
+import "vec";
+import "std/arena";
+import "buf";
+import "xml";
+import "zip";
+import "model";
+
+struct DxpStyle {
+  id: string;
+  name: string;
+  based_on: string;
+  heading: int32;
+  bold: bool;
+  italic: bool;
+  underline: bool;
+  strike: bool;
+  size: float64;
+  color: uint32;
+  font: int32;
+  has_font: bool;
+  align: int32;
+  space_before: float64;
+  space_after: float64;
+  line_spacing: float64;
+  indent_left: float64;
+  indent_right: float64;
+  first_line: float64;
+}
+
+struct DxpListLevel {
+  ilvl: int32;
+  fmt: string;
+  text: string;
+  start: int32;
+}
+
+struct DxpAbstractNum {
+  id: int32;
+  levels: DxpVec<DxpListLevel>;
+}
+
+struct DxpNumRef {
+  num_id: int32;
+  abstract_id: int32;
+}
+
+struct DxpNumState {
+  num_id: int32;
+  counters: int32[9];
+  used: bool;
+}
+
+struct DxpRel {
+  id: string;
+  target: string;
+}
+
+struct DxpDocxCtx {
+  zip: DxpZip*;
+  arena: Arena*;
+  doc: DxpDocument*;
+  styles: DxpVec<DxpStyle>;
+  abstracts: DxpVec<DxpAbstractNum>;
+  nums: DxpVec<DxpNumRef>;
+  num_states: DxpVec<DxpNumState>;
+  rels: DxpVec<DxpRel>;
+  default_style: string;
+  default_size: float64;
+  default_font: int32;
+  has_default_size: bool;
+  has_default_font: bool;
+  err: int32;
+}
+
+fn dxp_ascii_icontains(s: string, needle: string) -> bool {
+  var n: int64 = (int64)needle.length;
+  if (n == 0) { return true; }
+  var i: int64 = 0;
+  while (i + n <= (int64)s.length) {
+    var ok: bool = true;
+    var j: int64 = 0;
+    while (j < n) {
+      var a: uint8 = s.chars[i + j];
+      var b: uint8 = needle.chars[j];
+      if (a >= 'A' && a <= 'Z') { a = (uint8)(a + 32); }
+      if (b >= 'A' && b <= 'Z') { b = (uint8)(b + 32); }
+      if (a != b) { ok = false; break; }
+      j = j + 1;
+    }
+    if (ok) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn dxp_ascii_iprefix(s: string, prefix: string) -> bool {
+  if (prefix.length > s.length) { return false; }
+  var i: int64 = 0;
+  while (i < (int64)prefix.length) {
+    var a: uint8 = s.chars[i];
+    var b: uint8 = prefix.chars[i];
+    if (a >= 'A' && a <= 'Z') { a = (uint8)(a + 32); }
+    if (b >= 'A' && b <= 'Z') { b = (uint8)(b + 32); }
+    if (a != b) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn dxp_hex_color(s: string, fallback: uint32) -> uint32 {
+  if (s.length < 6) { return fallback; }
+  var v: uint32 = 0;
+  var i: int64 = 0;
+  while (i < 6) {
+    var c: uint8 = s.chars[i];
+    var d: uint32 = 0;
+    if (c >= '0' && c <= '9') { d = (uint32)(c - '0'); }
+    else if (c >= 'a' && c <= 'f') { d = (uint32)(c - 'a' + 10); }
+    else if (c >= 'A' && c <= 'F') { d = (uint32)(c - 'A' + 10); }
+    else { return fallback; }
+    v = (v << 4) | d;
+    i = i + 1;
+  }
+  return v;
+}
+
+fn dxp_style_font(rfonts: DxpXmlNode*) -> int32 {
+  if (rfonts == 0) { return DXP_FONT_SANS; }
+  var name: string = dxp_xml_attr(rfonts, "ascii");
+  if (name.length == 0) { name = dxp_xml_attr(rfonts, "hAnsi"); }
+  if (name.length == 0) { name = dxp_xml_attr(rfonts, "cs"); }
+  if (name.length == 0) { return DXP_FONT_SANS; }
+  if (dxp_ascii_icontains(name, "courier") || dxp_ascii_icontains(name, "consolas") ||
+      dxp_ascii_icontains(name, "mono")) {
+    return DXP_FONT_MONO;
+  }
+  if (dxp_ascii_icontains(name, "times") || dxp_ascii_icontains(name, "georgia") ||
+      dxp_ascii_icontains(name, "garamond") || dxp_ascii_icontains(name, "cambria") ||
+      dxp_ascii_icontains(name, "serif") || dxp_ascii_icontains(name, "book")) {
+    return DXP_FONT_SERIF;
+  }
+  return DXP_FONT_SANS;
+}
+
+fn dxp_style_new() -> DxpStyle {
+  var s: DxpStyle;
+  s.id = "";
+  s.name = "";
+  s.based_on = "";
+  s.heading = 0;
+  s.bold = false;
+  s.italic = false;
+  s.underline = false;
+  s.strike = false;
+  s.size = 0.0;
+  s.color = 0;
+  s.font = DXP_FONT_SANS;
+  s.has_font = false;
+  s.align = -1;
+  s.space_before = 0.0;
+  s.space_after = 0.0;
+  s.line_spacing = 0.0;
+  s.indent_left = 0.0;
+  s.indent_right = 0.0;
+  s.first_line = 0.0;
+  return s;
+}
+
+fn dxp_apply_rpr_to_style(s: DxpStyle*, rpr: DxpXmlNode*) {
+  if (rpr == 0) { return; }
+  var b: DxpXmlNode* = dxp_xml_child(rpr, "b");
+  if (b != 0) { s->bold = dxp_xml_attr_bool(b, "val", true); }
+  var i: DxpXmlNode* = dxp_xml_child(rpr, "i");
+  if (i != 0) { s->italic = dxp_xml_attr_bool(i, "val", true); }
+  var u: DxpXmlNode* = dxp_xml_child(rpr, "u");
+  if (u != 0) {
+    var uv: string = dxp_xml_attr(u, "val");
+    s->underline = uv != "none";
+  }
+  var st: DxpXmlNode* = dxp_xml_child(rpr, "strike");
+  if (st != 0) { s->strike = dxp_xml_attr_bool(st, "val", true); }
+  var sz: DxpXmlNode* = dxp_xml_child(rpr, "sz");
+  if (sz != 0) {
+    var v: int64 = dxp_xml_attr_int(sz, "val");
+    if (v > 0) { s->size = (float64)v / 2.0; }
+  }
+  var col: DxpXmlNode* = dxp_xml_child(rpr, "color");
+  if (col != 0) {
+    var cv: string = dxp_xml_attr(col, "val");
+    if (cv.length > 0 && cv != "auto") { s->color = dxp_hex_color(cv, s->color); }
+  }
+  var rf: DxpXmlNode* = dxp_xml_child(rpr, "rFonts");
+  if (rf != 0) {
+    s->font = dxp_style_font(rf);
+    s->has_font = true;
+  }
+}
+
+fn dxp_apply_ppr_to_style(s: DxpStyle*, ppr: DxpXmlNode*) {
+  if (ppr == 0) { return; }
+  var jc: DxpXmlNode* = dxp_xml_child(ppr, "jc");
+  if (jc != 0) {
+    var v: string = dxp_xml_attr(jc, "val");
+    if (v == "center") { s->align = DXP_ALIGN_CENTER; }
+    else if (v == "right" || v == "end") { s->align = DXP_ALIGN_RIGHT; }
+    else if (v == "both" || v == "distribute") { s->align = DXP_ALIGN_JUSTIFY; }
+    else { s->align = DXP_ALIGN_LEFT; }
+  }
+  var sp: DxpXmlNode* = dxp_xml_child(ppr, "spacing");
+  if (sp != 0) {
+    var before: int64 = dxp_xml_attr_int(sp, "before");
+    var after: int64 = dxp_xml_attr_int(sp, "after");
+    var line: int64 = dxp_xml_attr_int(sp, "line");
+    if (before != 0) { s->space_before = (float64)before / 20.0; }
+    if (after != 0) { s->space_after = (float64)after / 20.0; }
+    if (line != 0) { s->line_spacing = (float64)line / 240.0; }
+  }
+  var ind: DxpXmlNode* = dxp_xml_child(ppr, "ind");
+  if (ind != 0) {
+    var left: int64 = dxp_xml_attr_int(ind, "left");
+    if (left == 0) { left = dxp_xml_attr_int(ind, "start"); }
+    var right: int64 = dxp_xml_attr_int(ind, "right");
+    if (right == 0) { right = dxp_xml_attr_int(ind, "end"); }
+    var first: int64 = dxp_xml_attr_int(ind, "firstLine");
+    var hanging: int64 = dxp_xml_attr_int(ind, "hanging");
+    if (left != 0) { s->indent_left = (float64)left / 20.0; }
+    if (right != 0) { s->indent_right = (float64)right / 20.0; }
+    if (first != 0) { s->first_line = (float64)first / 20.0; }
+    if (hanging != 0) { s->first_line = -(float64)hanging / 20.0; }
+  }
+  var ol: DxpXmlNode* = dxp_xml_child(ppr, "outlineLvl");
+  if (ol != 0) {
+    var lv: int64 = dxp_xml_attr_int(ol, "val");
+    if (lv >= 0 && lv < 9) { s->heading = (int32)lv + 1; }
+  }
+}
+
+fn dxp_style_find(ctx: DxpDocxCtx*, id: string) -> DxpStyle* {
+  if (id.length == 0) { return 0; }
+  for i in 0..ctx->styles.length {
+    var s: DxpStyle* = &ctx->styles.data[i];
+    if (s->id == id) { return s; }
+  }
+  return 0;
+}
+
+// Resolve basedOn chains (bounded to avoid a malformed cycle).
+fn dxp_style_resolve(ctx: DxpDocxCtx*, id: string) -> DxpStyle {
+  var out: DxpStyle = dxp_style_new();
+  if (id.length == 0) { return out; }
+  var chain: string[16];
+  var n: int32 = 0;
+  var cur: string = id;
+  while (cur.length > 0 && n < 16) {
+    chain[n] = cur;
+    n = n + 1;
+    var s: DxpStyle* = dxp_style_find(ctx, cur);
+    if (s == 0) { break; }
+    cur = s->based_on;
+  }
+  // Apply oldest first.
+  var k: int32 = n - 1;
+  while (k >= 0) {
+    var s: DxpStyle* = dxp_style_find(ctx, chain[k]);
+    if (s != 0) {
+      if (s->heading != 0) { out.heading = s->heading; }
+      if (s->bold) { out.bold = true; }
+      if (s->italic) { out.italic = true; }
+      if (s->underline) { out.underline = true; }
+      if (s->strike) { out.strike = true; }
+      if (s->size > 0.0) { out.size = s->size; }
+      if (s->color != 0) { out.color = s->color; }
+      if (s->has_font) { out.font = s->font; out.has_font = true; }
+      if (s->align >= 0) { out.align = s->align; }
+      if (s->space_before != 0.0) { out.space_before = s->space_before; }
+      if (s->space_after != 0.0) { out.space_after = s->space_after; }
+      if (s->line_spacing != 0.0) { out.line_spacing = s->line_spacing; }
+      if (s->indent_left != 0.0) { out.indent_left = s->indent_left; }
+      if (s->indent_right != 0.0) { out.indent_right = s->indent_right; }
+      if (s->first_line != 0.0) { out.first_line = s->first_line; }
+    }
+    k = k - 1;
+  }
+  return out;
+}
+
+fn dxp_style_name_heading(name: string) -> int32 {
+  if (dxp_ascii_iprefix(name, "heading ") && name.length > 8) {
+    var tail: string = str_slice(name, 8, (int64)name.length - 8);
+    var v: int64 = str_to_i64_or(str_trim(tail), 0);
+    if (v >= 1 && v <= 9) { return (int32)v; }
+  }
+  if (dxp_ascii_iprefix(name, "heading") && name.length > 7) {
+    var tail: string = str_slice(name, 7, (int64)name.length - 7);
+    var v: int64 = str_to_i64_or(str_trim(tail), 0);
+    if (v >= 1 && v <= 9) { return (int32)v; }
+  }
+  return 0;
+}
+
+fn dxp_parse_styles(ctx: DxpDocxCtx*, root: DxpXmlNode*) {
+  if (root == 0) { return; }
+  var dd: DxpXmlNode* = dxp_xml_child(root, "docDefaults");
+  if (dd != 0) {
+    var rpd: DxpXmlNode* = dxp_xml_child(dd, "rPrDefault");
+    if (rpd != 0) {
+      var rpr: DxpXmlNode* = dxp_xml_child(rpd, "rPr");
+      if (rpr != 0) {
+        var tmp: DxpStyle = dxp_style_new();
+        dxp_apply_rpr_to_style(&tmp, rpr);
+        if (tmp.size > 0.0) {
+          ctx->default_size = tmp.size;
+          ctx->has_default_size = true;
+        }
+        if (tmp.has_font) {
+          ctx->default_font = tmp.font;
+          ctx->has_default_font = true;
+        }
+      }
+    }
+  }
+  for i in 0..root->kids.length {
+    var st: DxpXmlNode* = root->kids.data[i];
+    if (!dxp_xml_name_eq(st, "style")) { continue; }
+    var typ: string = dxp_xml_attr(st, "type");
+    if (typ.length > 0 && typ != "paragraph" && typ != "character") { continue; }
+    var s: DxpStyle = dxp_style_new();
+    s.id = dxp_xml_attr(st, "styleId");
+    var nm: DxpXmlNode* = dxp_xml_child(st, "name");
+    if (nm != 0) { s.name = dxp_xml_attr(nm, "val"); }
+    var bo: DxpXmlNode* = dxp_xml_child(st, "basedOn");
+    if (bo != 0) { s.based_on = dxp_xml_attr(bo, "val"); }
+    s.heading = dxp_style_name_heading(s.name);
+    if (s.heading == 0) { s.heading = dxp_style_name_heading(s.id); }
+    dxp_apply_rpr_to_style(&s, dxp_xml_child(st, "rPr"));
+    dxp_apply_ppr_to_style(&s, dxp_xml_child(st, "pPr"));
+    if (s.id == "Normal" || s.name == "Normal") {
+      if (ctx->default_style.length == 0) { ctx->default_style = s.id; }
+    }
+    dxp_vec_push<DxpStyle>(&ctx->styles, s);
+  }
+}
+
+fn dxp_level_from_node(lvl: DxpXmlNode*, arena: Arena*) -> DxpListLevel {
+  var l: DxpListLevel;
+  l.ilvl = (int32)dxp_xml_attr_int(lvl, "ilvl");
+  l.fmt = "decimal";
+  l.text = "";
+  l.start = 1;
+  var f: DxpXmlNode* = dxp_xml_child(lvl, "numFmt");
+  if (f != 0) { l.fmt = dxp_str_dup_arena(arena, dxp_xml_attr(f, "val")); }
+  var t: DxpXmlNode* = dxp_xml_child(lvl, "lvlText");
+  if (t != 0) { l.text = dxp_str_dup_arena(arena, dxp_xml_attr(t, "val")); }
+  var st: DxpXmlNode* = dxp_xml_child(lvl, "start");
+  if (st != 0) {
+    var v: int64 = dxp_xml_attr_int(st, "val");
+    if (v > 0) { l.start = (int32)v; }
+  }
+  return l;
+}
+
+fn dxp_parse_numbering(ctx: DxpDocxCtx*, root: DxpXmlNode*) {
+  if (root == 0) { return; }
+  // Abstract definitions first.
+  for i in 0..root->kids.length {
+    var an: DxpXmlNode* = root->kids.data[i];
+    if (!dxp_xml_name_eq(an, "abstractNum")) { continue; }
+    var a: DxpAbstractNum;
+    a.id = (int32)dxp_xml_attr_int(an, "abstractNumId");
+    a.levels = dxp_vec_init<DxpListLevel>();
+    for j in 0..an->kids.length {
+      var lv: DxpXmlNode* = an->kids.data[j];
+      if (dxp_xml_name_eq(lv, "lvl")) {
+        var l: DxpListLevel = dxp_level_from_node(lv, ctx->arena);
+        dxp_vec_push<DxpListLevel>(&a.levels, l);
+      }
+    }
+    dxp_vec_push<DxpAbstractNum>(&ctx->abstracts, a);
+  }
+  for i in 0..root->kids.length {
+    var nn: DxpXmlNode* = root->kids.data[i];
+    if (!dxp_xml_name_eq(nn, "num")) { continue; }
+    var nr: DxpNumRef;
+    nr.num_id = (int32)dxp_xml_attr_int(nn, "numId");
+    nr.abstract_id = 0;
+    var ai: DxpXmlNode* = dxp_xml_child(nn, "abstractNumId");
+    if (ai != 0) { nr.abstract_id = (int32)dxp_xml_attr_int(ai, "val"); }
+    dxp_vec_push<DxpNumRef>(&ctx->nums, nr);
+  }
+}
+
+fn dxp_abstract_find(ctx: DxpDocxCtx*, id: int32) -> DxpAbstractNum* {
+  for i in 0..ctx->abstracts.length {
+    if (ctx->abstracts.data[i].id == id) { return &ctx->abstracts.data[i]; }
+  }
+  return 0;
+}
+
+fn dxp_level_find(a: DxpAbstractNum*, ilvl: int32) -> DxpListLevel* {
+  for i in 0..a->levels.length {
+    if (a->levels.data[i].ilvl == ilvl) { return &a->levels.data[i]; }
+  }
+  if (a->levels.length > 0) { return &a->levels.data[0]; }
+  return 0;
+}
+
+fn dxp_num_state(ctx: DxpDocxCtx*, num_id: int32) -> DxpNumState* {
+  for i in 0..ctx->num_states.length {
+    if (ctx->num_states.data[i].num_id == num_id) {
+      return &ctx->num_states.data[i];
+    }
+  }
+  var s: DxpNumState;
+  s.num_id = num_id;
+  s.used = false;
+  for i in 0..9 { s.counters[i] = 0; }
+  dxp_vec_push<DxpNumState>(&ctx->num_states, s);
+  return &ctx->num_states.data[ctx->num_states.length - 1];
+}
+
+fn dxp_roman(a: Arena*, n_in: int32, upper: bool) -> string {
+  var tmp: DxpBuf;
+  var n: int32 = n_in;
+  var vals: int32[13] = [1000,900,500,400,100,90,50,40,10,9,5,4,1];
+  var syms: string[13] = ["m","cm","d","cd","c","xc","l","xl","x","ix","v","iv","i"];
+  for i in 0..13 {
+    while (n >= vals[i]) {
+      dxp_buf_puts(&tmp, syms[i]);
+      n = n - vals[i];
+    }
+  }
+  var s: string = dxp_buf_view(&tmp);
+  if (upper) {
+    for i in 0..(int64)s.length {
+      var c: uint8 = s.chars[i];
+      if (c >= 'a' && c <= 'z') { s.chars[i] = (uint8)(c - 32); }
+    }
+  }
+  // The bytes live in the temporary buffer; copy into the arena before free.
+  var out: string = dxp_str_dup_arena(a, s);
+  dxp_buf_free(&tmp);
+  return out;
+}
+
+fn dxp_alpha(a: Arena*, n_in: int32, upper: bool) -> string {
+  var tmp: DxpBuf;
+  var n: int32 = n_in;
+  if (n < 1) { n = 1; }
+  var base: int32 = (int32)'a';
+  if (upper) { base = (int32)'A'; }
+  dxp_buf_put(&tmp, (uint8)(base + ((n - 1) % 26)));
+  var s: string = dxp_buf_view(&tmp);
+  var out: string = dxp_str_dup_arena(a, s);
+  dxp_buf_free(&tmp);
+  return out;
+}
+
+fn dxp_fmt_counter(a: Arena*, v: int32, fmt: string, upper: bool) -> string {
+  if (fmt == "none") { return ""; }
+  if (fmt == "lowerLetter") { return dxp_alpha(a, v, false); }
+  if (fmt == "upperLetter") { return dxp_alpha(a, v, true); }
+  if (fmt == "lowerRoman") { return dxp_roman(a, v, false); }
+  if (fmt == "upperRoman") { return dxp_roman(a, v, true); }
+  if (fmt == "decimalZero" && v < 10) {
+    var tmp: DxpBuf;
+    dxp_buf_put(&tmp, (uint8)'0');
+    dxp_buf_put_i64(&tmp, (int64)v);
+    var s: string = dxp_str_dup_arena(a, dxp_buf_view(&tmp));
+    dxp_buf_free(&tmp);
+    return s;
+  }
+  var tmp2: DxpBuf;
+  dxp_buf_put_i64(&tmp2, (int64)v);
+  var s2: string = dxp_str_dup_arena(a, dxp_buf_view(&tmp2));
+  dxp_buf_free(&tmp2);
+  return s2;
+}
+
+fn dxp_list_prefix(ctx: DxpDocxCtx*, num_id: int32, ilvl: int32) -> string {
+  var nr: DxpNumRef* = 0;
+  for i in 0..ctx->nums.length {
+    if (ctx->nums.data[i].num_id == num_id) { nr = &ctx->nums.data[i]; break; }
+  }
+  if (nr == 0) { return ""; }
+  var a: DxpAbstractNum* = dxp_abstract_find(ctx, nr->abstract_id);
+  if (a == 0) { return ""; }
+  var lv: DxpListLevel* = dxp_level_find(a, ilvl);
+  if (lv == 0) { return ""; }
+  var st: DxpNumState* = dxp_num_state(ctx, num_id);
+  if (!st->used) {
+    for i in 0..9 { st->counters[i] = 0; }
+    st->used = true;
+  }
+  if (ilvl < 0) { ilvl = 0; }
+  if (ilvl > 8) { ilvl = 8; }
+  if (st->counters[ilvl] == 0) { st->counters[ilvl] = lv->start; }
+  else { st->counters[ilvl] = st->counters[ilvl] + 1; }
+  for i in (ilvl + 1)..9 { st->counters[i] = 0; }
+
+  if (lv->fmt == "bullet") {
+    if (lv->text.length > 0) { return lv->text; }
+    var bb: DxpBuf;
+    dxp_buf_put(&bb, 226);
+    dxp_buf_put(&bb, 128);
+    dxp_buf_put(&bb, 162);
+    var bs: string = dxp_str_dup_arena(ctx->arena, dxp_buf_view(&bb));
+    dxp_buf_free(&bb);
+    return bs;
+  }
+  var text: string = lv->text;
+  if (text.length == 0) { text = "%1."; }
+  var tmp: DxpBuf;
+  var i: int64 = 0;
+  while (i < (int64)text.length) {
+    if (text.chars[i] == '%' && i + 1 < (int64)text.length &&
+        text.chars[i + 1] >= '1' && text.chars[i + 1] <= '9') {
+      var lvnum: int32 = (int32)(text.chars[i + 1] - '1');
+      var val: int32 = st->counters[lvnum];
+      if (val <= 0) { val = 1; }
+      var part: string = dxp_fmt_counter(ctx->arena, val, lv->fmt, false);
+      dxp_buf_puts(&tmp, part);
+      i = i + 2;
+    } else {
+      dxp_buf_put(&tmp, text.chars[i]);
+      i = i + 1;
+    }
+  }
+  var out: string = dxp_str_dup_arena(ctx->arena, dxp_buf_view(&tmp));
+  dxp_buf_free(&tmp);
+  return out;
+}
+
+fn dxp_parse_rels(ctx: DxpDocxCtx*, root: DxpXmlNode*) {
+  if (root == 0) { return; }
+  for i in 0..root->kids.length {
+    var r: DxpXmlNode* = root->kids.data[i];
+    if (!dxp_xml_name_eq(r, "Relationship")) { continue; }
+    var rel: DxpRel;
+    rel.id = dxp_str_dup_arena(ctx->arena, dxp_xml_attr(r, "Id"));
+    rel.target = dxp_str_dup_arena(ctx->arena, dxp_xml_attr(r, "Target"));
+    if (rel.id.length > 0 && rel.target.length > 0) {
+      dxp_vec_push<DxpRel>(&ctx->rels, rel);
+    }
+  }
+}
+
+fn dxp_rel_target(ctx: DxpDocxCtx*, id: string) -> string {
+  for i in 0..ctx->rels.length {
+    if (ctx->rels.data[i].id == id) { return ctx->rels.data[i].target; }
+  }
+  return "";
+}
+
+fn dxp_media_path(ctx: DxpDocxCtx*, target: string) -> string {
+  var t: string = target;
+  if (t.length > 0 && t.chars[0] == '/') {
+    t = str_slice(t, 1, (int64)t.length - 1);
+    return dxp_str_dup_arena(ctx->arena, t);
+  }
+  if (dxp_ascii_iprefix(t, "word/")) { return dxp_str_dup_arena(ctx->arena, t); }
+  var tmp: DxpBuf;
+  dxp_buf_puts(&tmp, "word/");
+  dxp_buf_puts(&tmp, t);
+  var out: string = dxp_str_dup_arena(ctx->arena, dxp_buf_view(&tmp));
+  dxp_buf_free(&tmp);
+  return out;
+}
+
+fn dxp_be32(p: uint8*, off: int64) -> uint32 {
+  return ((uint32)p[off] << 24) | ((uint32)p[off + 1] << 16) |
+         ((uint32)p[off + 2] << 8) | (uint32)p[off + 3];
+}
+
+fn dxp_be16(p: uint8*, off: int64) -> uint32 {
+  return ((uint32)p[off] << 8) | (uint32)p[off + 1];
+}
+
+fn dxp_png_size(data: uint8*, len: int64, w: float64*, h: float64*) -> bool {
+  if (len < 24) { return false; }
+  if (data[0] != 137 || data[1] != 80 || data[2] != 78 || data[3] != 71) {
+    return false;
+  }
+  var pw: uint32 = dxp_be32(data, 16);
+  var ph: uint32 = dxp_be32(data, 20);
+  if (pw == 0 || ph == 0) { return false; }
+  *w = (float64)pw * 0.75;
+  *h = (float64)ph * 0.75;
+  return true;
+}
+
+fn dxp_jpeg_size(data: uint8*, len: int64, w: float64*, h: float64*) -> bool {
+  if (len < 4 || data[0] != 0xFF || data[1] != 0xD8) { return false; }
+  var i: int64 = 2;
+  while (i + 8 < len) {
+    if (data[i] != 0xFF) { i = i + 1; continue; }
+    var m: uint8 = data[i + 1];
+    if (m == 0xD8 || m == 0xD9 || (m >= 0xD0 && m <= 0xD7)) {
+      i = i + 2;
+      continue;
+    }
+    if (i + 4 > len) { break; }
+    var seg: int64 = (int64)dxp_be16(data, i + 2);
+    if (seg < 2) { break; }
+    if ((m >= 0xC0 && m <= 0xC3) || (m >= 0xC5 && m <= 0xC7) ||
+        (m >= 0xC9 && m <= 0xCB) || (m >= 0xCD && m <= 0xCF)) {
+      if (i + 9 > len) { break; }
+      var ph: uint32 = dxp_be16(data, i + 5);
+      var pw: uint32 = dxp_be16(data, i + 7);
+      if (pw == 0 || ph == 0) { return false; }
+      *w = (float64)pw * 0.75;
+      *h = (float64)ph * 0.75;
+      return true;
+    }
+    i = i + 2 + seg;
+  }
+  return false;
+}
+
+fn dxp_load_image(ctx: DxpDocxCtx*, rel_id: string, cx: int64, cy: int64) -> DxpImage* {
+  var target: string = dxp_rel_target(ctx, rel_id);
+  if (target.length == 0) { return 0; }
+  var path: string = dxp_media_path(ctx, target);
+  var len: int64 = 0;
+  var data: uint8* = dxp_zip_read_named(ctx->zip, path, &len);
+  if (data == 0) { return 0; }
+  var kind: int32 = 0;
+  if (len > 3 && data[0] == 0xFF && data[1] == 0xD8) { kind = DXP_IMG_JPEG; }
+  else if (len > 4 && data[0] == 137 && data[1] == 80) { kind = DXP_IMG_PNG; }
+  if (kind == 0) {
+    free(data);
+    return 0;
+  }
+  var iw: float64 = 0.0;
+  var ih: float64 = 0.0;
+  if (kind == DXP_IMG_PNG) { dxp_png_size(data, len, &iw, &ih); }
+  else { dxp_jpeg_size(data, len, &iw, &ih); }
+  if (cx > 0 && cy > 0) {
+    iw = (float64)cx / 12700.0;
+    ih = (float64)cy / 12700.0;
+  }
+  if (iw <= 0.0 || ih <= 0.0) {
+    iw = 144.0;
+    ih = 108.0;
+  }
+  var img: DxpImage* = new DxpImage;
+  img->data = data;
+  img->len = len;
+  img->kind = kind;
+  img->width = iw;
+  img->height = ih;
+  img->src_name = dxp_str_dup_arena(ctx->arena, path);
+  return img;
+}
+
+fn dxp_find_desc(node: DxpXmlNode*, name: string) -> DxpXmlNode* {
+  if (node == 0) { return 0; }
+  for i in 0..node->kids.length {
+    var c: DxpXmlNode* = node->kids.data[i];
+    if (dxp_xml_name_eq(c, name)) { return c; }
+    var d: DxpXmlNode* = dxp_find_desc(c, name);
+    if (d != 0) { return d; }
+  }
+  return 0;
+}
+
+fn dxp_parse_drawing(ctx: DxpDocxCtx*, node: DxpXmlNode*) -> DxpImage* {
+  var blip: DxpXmlNode* = dxp_find_desc(node, "blip");
+  if (blip == 0) { return 0; }
+  var rid: string = dxp_xml_attr(blip, "embed");
+  if (rid.length == 0) { rid = dxp_xml_attr(blip, "r:embed"); }
+  if (rid.length == 0) { rid = dxp_xml_attr(blip, "link"); }
+  if (rid.length == 0) { return 0; }
+  var ext: DxpXmlNode* = dxp_find_desc(node, "extent");
+  var cx: int64 = 0;
+  var cy: int64 = 0;
+  if (ext != 0) {
+    cx = dxp_xml_attr_int(ext, "cx");
+    cy = dxp_xml_attr_int(ext, "cy");
+  }
+  return dxp_load_image(ctx, rid, cx, cy);
+}
+
+fn dxp_rpr_bool(rpr: DxpXmlNode*, name: string, fallback: bool) -> bool {
+  var n: DxpXmlNode* = dxp_xml_child(rpr, name);
+  if (n == 0) { return fallback; }
+  return dxp_xml_attr_bool(n, "val", true);
+}
+
+fn dxp_add_text_run(ctx: DxpDocxCtx*, p: DxpParagraph*, text: string,
+                    st: DxpStyle, rpr: DxpXmlNode*) {
+  if (text.length == 0) { return; }
+  var b: bool = st.bold;
+  var it: bool = st.italic;
+  var un: bool = st.underline;
+  var strike: bool = st.strike;
+  var sz: float64 = st.size;
+  var col: uint32 = st.color;
+  var fnt: int32 = st.font;
+  if (rpr != 0) {
+    b = dxp_rpr_bool(rpr, "b", b);
+    it = dxp_rpr_bool(rpr, "i", it);
+    var u: DxpXmlNode* = dxp_xml_child(rpr, "u");
+    if (u != 0) {
+      var uv: string = dxp_xml_attr(u, "val");
+      un = uv != "none";
+    }
+    strike = dxp_rpr_bool(rpr, "strike", strike);
+    var szn: DxpXmlNode* = dxp_xml_child(rpr, "sz");
+    if (szn != 0) {
+      var v: int64 = dxp_xml_attr_int(szn, "val");
+      if (v > 0) { sz = (float64)v / 2.0; }
+    }
+    var cn: DxpXmlNode* = dxp_xml_child(rpr, "color");
+    if (cn != 0) {
+      var cv: string = dxp_xml_attr(cn, "val");
+      if (cv.length > 0 && cv != "auto") { col = dxp_hex_color(cv, col); }
+    }
+    var rfn: DxpXmlNode* = dxp_xml_child(rpr, "rFonts");
+    if (rfn != 0) { fnt = dxp_style_font(rfn); }
+  }
+  if (sz <= 0.0) { sz = ctx->doc->default_size; }
+  var kept: string = dxp_str_dup_arena(ctx->arena, text);
+  dxp_para_add_text(p, kept, sz, fnt, b, it, un, col);
+}
+
+fn dxp_run_text(ctx: DxpDocxCtx*, r: DxpXmlNode*, p: DxpParagraph*,
+                st: DxpStyle) {
+  var rpr: DxpXmlNode* = dxp_xml_child(r, "rPr");
+  for i in 0..r->kids.length {
+    var c: DxpXmlNode* = r->kids.data[i];
+    if (dxp_xml_name_eq(c, "t")) {
+      var t: string = dxp_xml_text(c);
+      dxp_add_text_run(ctx, p, t, st, rpr);
+    } else if (dxp_xml_name_eq(c, "tab")) {
+      dxp_add_text_run(ctx, p, "\t", st, rpr);
+    } else if (dxp_xml_name_eq(c, "br") || dxp_xml_name_eq(c, "cr")) {
+      var typ: string = dxp_xml_attr(c, "type");
+      if (typ == "page") {
+        p->page_break_after = true;
+      } else {
+        dxp_add_text_run(ctx, p, "\n", st, rpr);
+      }
+    } else if (dxp_xml_name_eq(c, "drawing") || dxp_xml_name_eq(c, "pict")) {
+      var img: DxpImage* = dxp_parse_drawing(ctx, c);
+      if (img != 0) {
+        var run: DxpRun;
+        dxp_run_init(&run);
+        run.image = img;
+        run.size = p->size;
+        if (run.size <= 0.0) { run.size = ctx->doc->default_size; }
+        run.font = st.font;
+        run.bold = st.bold;
+        run.italic = st.italic;
+        dxp_vec_push<DxpRun>(&p->runs, run);
+      }
+    } else if (dxp_xml_name_eq(c, "sym")) {
+      var hex: string = dxp_xml_attr(c, "char");
+      var v: int64 = 0;
+      if (hex.length >= 4) {
+        // Word writes F0xx for symbol-font code points.
+        var tmp: uint8[8];
+        var k: int64 = 0;
+        if (hex.length >= 4) {
+          tmp[0] = hex.chars[hex.length - 2];
+          tmp[1] = hex.chars[hex.length - 1];
+          // Parse two hex digits.
+          for q in 0..2 {
+            var ch: uint8 = tmp[q];
+            var d: int64 = 0;
+            if (ch >= '0' && ch <= '9') { d = ch - '0'; }
+            else if (ch >= 'a' && ch <= 'f') { d = ch - 'a' + 10; }
+            else if (ch >= 'A' && ch <= 'F') { d = ch - 'A' + 10; }
+            v = v * 16 + d;
+          }
+        }
+      }
+      if (v > 32) {
+        var chbuf: uint8[2];
+        chbuf[0] = (uint8)v;
+        var sv: string;
+        sv.chars = &chbuf[0];
+        sv.length = 1;
+        var copied: string = dxp_str_dup_arena(ctx->arena, sv);
+        dxp_add_text_run(ctx, p, copied, st, rpr);
+      }
+    }
+  }
+}
+
+fn dxp_walk_runs(ctx: DxpDocxCtx*, node: DxpXmlNode*, p: DxpParagraph*,
+                 st: DxpStyle, in_deleted: bool) {
+  for i in 0..node->kids.length {
+    var c: DxpXmlNode* = node->kids.data[i];
+    if (dxp_xml_name_eq(c, "r")) {
+      if (!in_deleted) { dxp_run_text(ctx, c, p, st); }
+    } else if (dxp_xml_name_eq(c, "hyperlink") || dxp_xml_name_eq(c, "smartTag") ||
+               dxp_xml_name_eq(c, "fldSimple") || dxp_xml_name_eq(c, "ins") ||
+               dxp_xml_name_eq(c, "customXml")) {
+      dxp_walk_runs(ctx, c, p, st, in_deleted);
+    } else if (dxp_xml_name_eq(c, "del")) {
+      dxp_walk_runs(ctx, c, p, st, true);
+    } else if (dxp_xml_name_eq(c, "sdt")) {
+      var content: DxpXmlNode* = dxp_xml_child(c, "sdtContent");
+      if (content != 0) { dxp_walk_runs(ctx, content, p, st, in_deleted); }
+    }
+  }
+}
+
+fn dxp_parse_paragraph(ctx: DxpDocxCtx*, pn: DxpXmlNode*) -> DxpParagraph {
+  var p: DxpParagraph;
+  dxp_para_init(&p);
+  var ppr: DxpXmlNode* = dxp_xml_child(pn, "pPr");
+  var style_id: string = "";
+  if (ppr != 0) {
+    var ps: DxpXmlNode* = dxp_xml_child(ppr, "pStyle");
+    if (ps != 0) { style_id = dxp_xml_attr(ps, "val"); }
+  }
+  if (style_id.length == 0) { style_id = ctx->default_style; }
+  var st: DxpStyle = dxp_style_resolve(ctx, style_id);
+  p.style_name = dxp_str_dup_arena(ctx->arena, style_id);
+  if (st.size > 0.0) { p.size = st.size; }
+  if (st.color != 0) { p.color = st.color; }
+  p.align = st.align;
+  if (p.align < 0) { p.align = DXP_ALIGN_LEFT; }
+  p.heading = st.heading;
+  p.space_before = st.space_before;
+  p.space_after = st.space_after;
+  p.line_spacing = st.line_spacing;
+  p.indent_left = st.indent_left;
+  p.indent_right = st.indent_right;
+  p.first_line = st.first_line;
+
+  // Direct paragraph properties override style properties.
+  if (ppr != 0) {
+    var jc: DxpXmlNode* = dxp_xml_child(ppr, "jc");
+    if (jc != 0) {
+      var v: string = dxp_xml_attr(jc, "val");
+      if (v == "center") { p.align = DXP_ALIGN_CENTER; }
+      else if (v == "right" || v == "end") { p.align = DXP_ALIGN_RIGHT; }
+      else if (v == "both" || v == "distribute") { p.align = DXP_ALIGN_JUSTIFY; }
+      else { p.align = DXP_ALIGN_LEFT; }
+    }
+    var sp: DxpXmlNode* = dxp_xml_child(ppr, "spacing");
+    if (sp != 0) {
+      var before: int64 = dxp_xml_attr_int(sp, "before");
+      var after: int64 = dxp_xml_attr_int(sp, "after");
+      var line: int64 = dxp_xml_attr_int(sp, "line");
+      if (before != 0) { p.space_before = (float64)before / 20.0; }
+      if (after != 0) { p.space_after = (float64)after / 20.0; }
+      if (line != 0) { p.line_spacing = (float64)line / 240.0; }
+    }
+    var ind: DxpXmlNode* = dxp_xml_child(ppr, "ind");
+    if (ind != 0) {
+      var left: int64 = dxp_xml_attr_int(ind, "left");
+      if (left == 0) { left = dxp_xml_attr_int(ind, "start"); }
+      var right: int64 = dxp_xml_attr_int(ind, "right");
+      if (right == 0) { right = dxp_xml_attr_int(ind, "end"); }
+      var first: int64 = dxp_xml_attr_int(ind, "firstLine");
+      var hang: int64 = dxp_xml_attr_int(ind, "hanging");
+      if (left != 0) { p.indent_left = (float64)left / 20.0; }
+      if (right != 0) { p.indent_right = (float64)right / 20.0; }
+      if (first != 0) { p.first_line = (float64)first / 20.0; }
+      if (hang != 0) { p.first_line = -(float64)hang / 20.0; }
+    }
+    var pb: DxpXmlNode* = dxp_xml_child(ppr, "pageBreakBefore");
+    if (pb != 0) { p.page_break_before = dxp_xml_attr_bool(pb, "val", true); }
+    var kt: DxpXmlNode* = dxp_xml_child(ppr, "keepNext");
+    if (kt != 0) { p.keep_together = dxp_xml_attr_bool(kt, "val", true); }
+    var numpr: DxpXmlNode* = dxp_xml_child(ppr, "numPr");
+    if (numpr != 0) {
+      var ilvl: int64 = 0;
+      var nid: int64 = 0;
+      var iln: DxpXmlNode* = dxp_xml_child(numpr, "ilvl");
+      if (iln != 0) { ilvl = dxp_xml_attr_int(iln, "val"); }
+      var nin: DxpXmlNode* = dxp_xml_child(numpr, "numId");
+      if (nin != 0) { nid = dxp_xml_attr_int(nin, "val"); }
+      if (nid > 0) {
+        p.list_level = (int32)ilvl;
+        p.list_prefix = dxp_list_prefix(ctx, (int32)nid, (int32)ilvl);
+        if (p.list_prefix.length > 0) {
+          var need: float64 = (float64)(ilvl + 1) * 18.0;
+          if (p.indent_left < need) { p.indent_left = need; }
+          if (p.first_line == 0.0) { p.first_line = -18.0; }
+          var tmp: DxpBuf;
+          dxp_buf_puts(&tmp, p.list_prefix);
+          dxp_buf_put(&tmp, (uint8)' ');
+          p.list_prefix = dxp_str_dup_arena(ctx->arena, dxp_buf_view(&tmp));
+          dxp_buf_free(&tmp);
+        }
+      }
+    }
+    var sect: DxpXmlNode* = dxp_xml_child(ppr, "sectPr");
+    if (sect != 0) {
+      var typ: DxpXmlNode* = dxp_xml_child(sect, "type");
+      if (typ != 0) {
+        var tv: string = dxp_xml_attr(typ, "val");
+        if (tv == "nextPage" || tv == "oddPage" || tv == "evenPage") {
+          p.page_break_after = true;
+        }
+      }
+    }
+  }
+
+  dxp_walk_runs(ctx, pn, &p, st, false);
+
+  // Headings get a sensible size even when the style omitted one.
+  if (p.heading > 0 && st.size <= 0.0) {
+    if (p.heading == 1) { p.size = 20.0; }
+    else if (p.heading == 2) { p.size = 16.0; }
+    else if (p.heading == 3) { p.size = 13.0; }
+    else { p.size = 11.5; }
+    for ri in 0..p.runs.length {
+      var rr: DxpRun* = &p.runs.data[ri];
+      if (rr->size <= 0.0 || rr->size == ctx->doc->default_size) { rr->size = p.size; }
+    }
+  }
+  return p;
+}
+
+fn dxp_parse_table(ctx: DxpDocxCtx*, tn: DxpXmlNode*) -> DxpTable* {
+  var t: DxpTable* = dxp_table_new();
+  var grid: DxpXmlNode* = dxp_xml_child(tn, "tblGrid");
+  if (grid != 0) {
+    for i in 0..grid->kids.length {
+      var gc: DxpXmlNode* = grid->kids.data[i];
+      if (!dxp_xml_name_eq(gc, "gridCol")) { continue; }
+      var w: int64 = dxp_xml_attr_int(gc, "w");
+      dxp_vec_push<float64>(&t->widths, (float64)w / 20.0);
+    }
+  }
+  for i in 0..tn->kids.length {
+    var rn: DxpXmlNode* = tn->kids.data[i];
+    if (!dxp_xml_name_eq(rn, "tr")) { continue; }
+    var header: bool = false;
+    var trpr: DxpXmlNode* = dxp_xml_child(rn, "trPr");
+    if (trpr != 0) {
+      var th: DxpXmlNode* = dxp_xml_child(trpr, "tblHeader");
+      if (th != 0) { header = dxp_xml_attr_bool(th, "val", true); }
+    }
+    var row: DxpTableRow* = dxp_table_add_row(t, header);
+    for j in 0..rn->kids.length {
+      var cn: DxpXmlNode* = rn->kids.data[j];
+      if (!dxp_xml_name_eq(cn, "tc")) { continue; }
+      var cell: DxpTableCell* = dxp_row_add_cell(row);
+      var tcpr: DxpXmlNode* = dxp_xml_child(cn, "tcPr");
+      if (tcpr != 0) {
+        var gs: DxpXmlNode* = dxp_xml_child(tcpr, "gridSpan");
+        if (gs != 0) {
+          var span: int64 = dxp_xml_attr_int(gs, "val");
+          if (span > 0) { cell->colspan = (int32)span; }
+        }
+        var vm: DxpXmlNode* = dxp_xml_child(tcpr, "vMerge");
+        if (vm != 0) {
+          var vv: string = dxp_xml_attr(vm, "val");
+          if (vv == "restart") { cell->rowspan = 2; }
+        }
+        var tcw: DxpXmlNode* = dxp_xml_child(tcpr, "tcW");
+        if (tcw != 0) {
+          var w: int64 = dxp_xml_attr_int(tcw, "w");
+          if (w > 0) { cell->width = (float64)w / 20.0; }
+        }
+        var shd: DxpXmlNode* = dxp_xml_child(tcpr, "shd");
+        if (shd != 0) {
+          var fill: string = dxp_xml_attr(shd, "fill");
+          if (fill.length > 0 && fill != "auto") {
+            cell->shade = dxp_hex_color(fill, 0);
+          }
+        }
+      }
+      // Paragraphs and nested tables inside the cell.
+      for k in 0..cn->kids.length {
+        var bn: DxpXmlNode* = cn->kids.data[k];
+        if (dxp_xml_name_eq(bn, "p")) {
+          var cp: DxpParagraph = dxp_parse_paragraph(ctx, bn);
+          var cb: DxpBlock* = dxp_block_new(DXP_BLOCK_PARA);
+          cb->para = cp;
+          dxp_vec_push<DxpBlock*>(&cell->blocks, cb);
+        } else if (dxp_xml_name_eq(bn, "tbl")) {
+          var ct: DxpTable* = dxp_parse_table(ctx, bn);
+          var tb: DxpBlock* = dxp_block_new(DXP_BLOCK_TABLE);
+          tb->table = ct;
+          dxp_vec_push<DxpBlock*>(&cell->blocks, tb);
+        } else if (dxp_xml_name_eq(bn, "sdt")) {
+          var content: DxpXmlNode* = dxp_xml_child(bn, "sdtContent");
+          if (content != 0) {
+            for q in 0..content->kids.length {
+              var qn: DxpXmlNode* = content->kids.data[q];
+              if (dxp_xml_name_eq(qn, "p")) {
+                var qp: DxpParagraph = dxp_parse_paragraph(ctx, qn);
+                var qb: DxpBlock* = dxp_block_new(DXP_BLOCK_PARA);
+                qb->para = qp;
+                dxp_vec_push<DxpBlock*>(&cell->blocks, qb);
+              }
+            }
+          }
+        }
+      }
+      if (cell->blocks.length == 0) {
+        var empty: DxpParagraph;
+        dxp_para_init(&empty);
+        var eb: DxpBlock* = dxp_block_new(DXP_BLOCK_PARA);
+        eb->para = empty;
+        dxp_vec_push<DxpBlock*>(&cell->blocks, eb);
+      }
+    }
+  }
+  return t;
+}
+
+fn dxp_parse_body_blocks(ctx: DxpDocxCtx*, parent: DxpXmlNode*,
+                         out: DxpVec<DxpBlock*>*) {
+  for i in 0..parent->kids.length {
+    var n: DxpXmlNode* = parent->kids.data[i];
+    if (dxp_xml_name_eq(n, "p")) {
+      var p: DxpParagraph = dxp_parse_paragraph(ctx, n);
+      var brk_after: bool = p.page_break_after;
+      var b: DxpBlock* = dxp_block_new(DXP_BLOCK_PARA);
+      b->para = p;
+      dxp_vec_push<DxpBlock*>(out, b);
+      if (brk_after) {
+        dxp_vec_push<DxpBlock*>(out, dxp_block_new(DXP_BLOCK_PAGEBREAK));
+      }
+    } else if (dxp_xml_name_eq(n, "tbl")) {
+      var t: DxpTable* = dxp_parse_table(ctx, n);
+      var tb: DxpBlock* = dxp_block_new(DXP_BLOCK_TABLE);
+      tb->table = t;
+      dxp_vec_push<DxpBlock*>(out, tb);
+    } else if (dxp_xml_name_eq(n, "sdt") || dxp_xml_name_eq(n, "customXml") ||
+               dxp_xml_name_eq(n, "ins")) {
+      var content: DxpXmlNode* = dxp_xml_child(n, "sdtContent");
+      if (content == 0) { content = n; }
+      dxp_parse_body_blocks(ctx, content, out);
+    }
+  }
+}
+
+fn dxp_parse_section(ctx: DxpDocxCtx*, sect: DxpXmlNode*) {
+  if (sect == 0) { return; }
+  var sz: DxpXmlNode* = dxp_xml_child(sect, "pgSz");
+  if (sz != 0) {
+    var w: int64 = dxp_xml_attr_int(sz, "w");
+    var h: int64 = dxp_xml_attr_int(sz, "h");
+    if (w > 0 && h > 0) {
+      ctx->doc->page_w = (float64)w / 20.0;
+      ctx->doc->page_h = (float64)h / 20.0;
+    }
+  }
+  var mar: DxpXmlNode* = dxp_xml_child(sect, "pgMar");
+  if (mar != 0) {
+    var top: int64 = dxp_xml_attr_int(mar, "top");
+    var right: int64 = dxp_xml_attr_int(mar, "right");
+    var bottom: int64 = dxp_xml_attr_int(mar, "bottom");
+    var left: int64 = dxp_xml_attr_int(mar, "left");
+    if (top >= 0) { ctx->doc->margin_t = (float64)top / 20.0; }
+    if (right >= 0) { ctx->doc->margin_r = (float64)right / 20.0; }
+    if (bottom >= 0) { ctx->doc->margin_b = (float64)bottom / 20.0; }
+    if (left >= 0) { ctx->doc->margin_l = (float64)left / 20.0; }
+  }
+}
+
+fn dxp_read_xml(ctx: DxpDocxCtx*, name: string) -> DxpXmlNode* {
+  var e: DxpZipEntry* = dxp_zip_find(ctx->zip, name);
+  if (e == 0) { return 0; }
+  var b: DxpBuf;
+  if (dxp_zip_read(ctx->zip, e, &b) != 0) {
+    dxp_buf_free(&b);
+    return 0;
+  }
+  var root: DxpXmlNode* = dxp_xml_parse(b.data, b.len, ctx->arena);
+  dxp_buf_free(&b);
+  return root;
+}
+
+export fn dxp_docx_read(data: uint8*, len: int64, arena: Arena*,
+                        doc: DxpDocument*) -> int32 {
+  dxp_doc_init(doc);
+  var z: DxpZip;
+  if (dxp_zip_open(&z, data, len, arena) != 0) {
+    dxp_zip_close(&z);
+    return -1;
+  }
+  var ctx: DxpDocxCtx;
+  ctx.zip = &z;
+  ctx.arena = arena;
+  ctx.doc = doc;
+  ctx.styles = dxp_vec_init<DxpStyle>();
+  ctx.abstracts = dxp_vec_init<DxpAbstractNum>();
+  ctx.nums = dxp_vec_init<DxpNumRef>();
+  ctx.num_states = dxp_vec_init<DxpNumState>();
+  ctx.rels = dxp_vec_init<DxpRel>();
+  ctx.default_style = "";
+  ctx.default_size = 11.0;
+  ctx.default_font = DXP_FONT_SANS;
+  ctx.has_default_size = false;
+  ctx.has_default_font = false;
+  ctx.err = 0;
+
+  var styles_root: DxpXmlNode* = dxp_read_xml(&ctx, "word/styles.xml");
+  dxp_parse_styles(&ctx, styles_root);
+  if (ctx.has_default_size) { doc->default_size = ctx.default_size; }
+  if (ctx.has_default_font) { doc->default_font = ctx.default_font; }
+
+  var numbering_root: DxpXmlNode* = dxp_read_xml(&ctx, "word/numbering.xml");
+  dxp_parse_numbering(&ctx, numbering_root);
+
+  var rels_root: DxpXmlNode* = dxp_read_xml(&ctx, "word/_rels/document.xml.rels");
+  dxp_parse_rels(&ctx, rels_root);
+
+  var doc_root: DxpXmlNode* = dxp_read_xml(&ctx, "word/document.xml");
+  if (doc_root == 0) {
+    dxp_xml_free(styles_root);
+    dxp_xml_free(numbering_root);
+    dxp_xml_free(rels_root);
+    dxp_vec_free<DxpStyle>(&ctx.styles);
+    for i in 0..ctx.abstracts.length { dxp_vec_free<DxpListLevel>(&ctx.abstracts.data[i].levels); }
+    dxp_vec_free<DxpAbstractNum>(&ctx.abstracts);
+    dxp_vec_free<DxpNumRef>(&ctx.nums);
+    dxp_vec_free<DxpNumState>(&ctx.num_states);
+    dxp_vec_free<DxpRel>(&ctx.rels);
+    dxp_zip_close(&z);
+    return -2;
+  }
+  var body: DxpXmlNode* = dxp_xml_child(doc_root, "body");
+  if (body != 0) {
+    dxp_parse_body_blocks(&ctx, body, &doc->blocks);
+    var sect: DxpXmlNode* = dxp_xml_child(body, "sectPr");
+    dxp_parse_section(&ctx, sect);
+  }
+
+  // Core properties, when present.
+  var core_root: DxpXmlNode* = dxp_read_xml(&ctx, "docProps/core.xml");
+  if (core_root != 0) {
+    var title: DxpXmlNode* = dxp_xml_find(core_root, "title");
+    if (title != 0) { doc->title = dxp_str_dup_arena(arena, dxp_xml_text(title)); }
+    var creator: DxpXmlNode* = dxp_xml_find(core_root, "creator");
+    if (creator != 0) { doc->author = dxp_str_dup_arena(arena, dxp_xml_text(creator)); }
+  }
+
+  dxp_xml_free(styles_root);
+  dxp_xml_free(numbering_root);
+  dxp_xml_free(rels_root);
+  dxp_xml_free(doc_root);
+  dxp_xml_free(core_root);
+  for i in 0..ctx.abstracts.length {
+    dxp_vec_free<DxpListLevel>(&ctx.abstracts.data[i].levels);
+  }
+  dxp_vec_free<DxpAbstractNum>(&ctx.abstracts);
+  dxp_vec_free<DxpNumRef>(&ctx.nums);
+  dxp_vec_free<DxpNumState>(&ctx.num_states);
+  dxp_vec_free<DxpRel>(&ctx.rels);
+  dxp_vec_free<DxpStyle>(&ctx.styles);
+  dxp_zip_close(&z);
+  return 0;
+}

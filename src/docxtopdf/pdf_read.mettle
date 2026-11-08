@@ -1,0 +1,1802 @@
+// Read text and basic layout from a PDF into the shared document model.
+//
+// The reader scans indirect objects, expands object streams, walks the page
+// tree, decodes Flate/ASCII streams, honours ToUnicode CMaps and font
+// differences, then groups positioned text into lines and paragraphs.
+
+import "std/mem";
+import "std/conv";
+import "std/arena";
+import "press/press";
+import "buf";
+import "vec";
+import "model";
+import "font";
+import "xml";
+
+const DXP_PDF_NULL: int32 = 0;
+const DXP_PDF_BOOL: int32 = 1;
+const DXP_PDF_INT: int32 = 2;
+const DXP_PDF_REAL: int32 = 3;
+const DXP_PDF_STRING: int32 = 4;
+const DXP_PDF_NAME: int32 = 5;
+const DXP_PDF_ARRAY: int32 = 6;
+const DXP_PDF_DICT: int32 = 7;
+const DXP_PDF_REF: int32 = 8;
+
+struct DxpPdfDictEntry {
+  key: string;
+  val: DxpPdfVal*;
+}
+
+struct DxpPdfVal {
+  kind: int32;
+  n: int64;
+  f: float64;
+  b: bool;
+  s: string;
+  arr: DxpVec<DxpPdfVal*>;
+  dict: DxpVec<DxpPdfDictEntry>;
+  ref_num: int32;
+}
+
+struct DxpPdfObj {
+  num: int32;
+  val: DxpPdfVal*;
+  has_stream: bool;
+  stream_start: int64;
+  stream_len: int64;
+}
+
+struct DxpPdfFile {
+  data: uint8*;
+  len: int64;
+  arena: Arena*;
+  objs: DxpVec<DxpPdfObj>;
+  root: DxpPdfVal*;
+}
+
+struct DxpPdfCur {
+  data: uint8*;
+  len: int64;
+  pos: int64;
+}
+
+struct DxpPdfCMapRange {
+  lo: int64;
+  hi: int64;
+  dst: string;
+  src_bytes: int32;
+}
+
+struct DxpPdfCMap {
+  ranges: DxpVec<DxpPdfCMapRange>;
+}
+
+struct DxpPdfCodeName {
+  code: int32;
+  name: string;
+}
+
+struct DxpPdfFont {
+  res_name: string;
+  val: DxpPdfVal*;
+  is_cid: bool;
+  cmap: DxpPdfCMap;
+  has_cmap: bool;
+  encoding: string;
+  diffs: DxpVec<DxpPdfCodeName>;
+  first_char: int32;
+  widths: DxpVec<float64>;
+  bold: bool;
+  italic: bool;
+}
+
+struct DxpPdfPageInfo {
+  page: DxpPdfVal*;
+  resources: DxpPdfVal*;
+  w: float64;
+  h: float64;
+}
+
+struct DxpPdfChunk {
+  text: string;
+  x: float64;
+  y: float64;
+  size: float64;
+  adv: float64;
+  bold: bool;
+  italic: bool;
+  page: int32;
+}
+
+struct DxpPdfGState {
+  ctm_a: float64;
+  ctm_b: float64;
+  ctm_c: float64;
+  ctm_d: float64;
+  ctm_e: float64;
+  ctm_f: float64;
+  font_name: string;
+  font_size: float64;
+  leading: float64;
+  char_space: float64;
+  word_space: float64;
+  hscale: float64;
+}
+
+struct DxpPdfTextState {
+  tm_a: float64;
+  tm_b: float64;
+  tm_c: float64;
+  tm_d: float64;
+  tm_e: float64;
+  tm_f: float64;
+  lm_a: float64;
+  lm_b: float64;
+  lm_c: float64;
+  lm_d: float64;
+  lm_e: float64;
+  lm_f: float64;
+  in_text: bool;
+}
+
+fn dxp_pdfr_val_new(a: Arena*, kind: int32) -> DxpPdfVal* {
+  var v: DxpPdfVal* = (DxpPdfVal*)arena_alloc(a, sizeof(DxpPdfVal));
+  if (v == 0) { return 0; }
+  memset((rawptr)v, 0, sizeof(DxpPdfVal));
+  v->kind = kind;
+  v->arr = dxp_vec_init<DxpPdfVal*>();
+  v->dict = dxp_vec_init<DxpPdfDictEntry>();
+  return v;
+}
+
+fn dxp_pdfr_is_ws(c: uint8) -> bool {
+  return c == 0 || c == 9 || c == 10 || c == 12 || c == 13 || c == 32;
+}
+
+fn dxp_pdfr_is_delim(c: uint8) -> bool {
+  return dxp_pdfr_is_ws(c) || c == '(' || c == ')' || c == '<' || c == '>' ||
+         c == '[' || c == ']' || c == '{' || c == '}' || c == '/' || c == '%';
+}
+
+fn dxp_pdfr_skip_ws(c: DxpPdfCur*) {
+  while (c->pos < c->len) {
+    var ch: uint8 = c->data[c->pos];
+    if (dxp_pdfr_is_ws(ch)) {
+      c->pos = c->pos + 1;
+    } else if (ch == '%') {
+      while (c->pos < c->len && c->data[c->pos] != 10 && c->data[c->pos] != 13) {
+        c->pos = c->pos + 1;
+      }
+    } else {
+      return;
+    }
+  }
+}
+
+fn dxp_pdfr_hex(c: uint8) -> int32 {
+  if (c >= '0' && c <= '9') { return (int32)(c - '0'); }
+  if (c >= 'a' && c <= 'f') { return (int32)(c - 'a' + 10); }
+  if (c >= 'A' && c <= 'F') { return (int32)(c - 'A' + 10); }
+  return -1;
+}
+
+fn dxp_pdfr_arena_bytes(a: Arena*, b: DxpBuf*) -> string {
+  var s: string = dxp_str_dup_arena(a, dxp_buf_view(b));
+  dxp_buf_free(b);
+  return s;
+}
+
+fn dxp_pdfr_parse_literal_string(c: DxpPdfCur*, a: Arena*) -> string {
+  var b: DxpBuf;
+  if (c->pos < c->len && c->data[c->pos] == '(') { c->pos = c->pos + 1; }
+  var depth: int32 = 1;
+  while (c->pos < c->len) {
+    var ch: uint8 = c->data[c->pos];
+    c->pos = c->pos + 1;
+    if (ch == '(') { depth = depth + 1; dxp_buf_put(&b, ch); continue; }
+    if (ch == ')') {
+      depth = depth - 1;
+      if (depth == 0) { break; }
+      dxp_buf_put(&b, ch);
+      continue;
+    }
+    if (ch != '\\') { dxp_buf_put(&b, ch); continue; }
+    if (c->pos >= c->len) { break; }
+    var e: uint8 = c->data[c->pos];
+    c->pos = c->pos + 1;
+    if (e == 'n') { dxp_buf_put(&b, 10); }
+    else if (e == 'r') { dxp_buf_put(&b, 13); }
+    else if (e == 't') { dxp_buf_put(&b, 9); }
+    else if (e == 'b') { dxp_buf_put(&b, 8); }
+    else if (e == 'f') { dxp_buf_put(&b, 12); }
+    else if (e == '(' || e == ')' || e == '\\') { dxp_buf_put(&b, e); }
+    else if (e == 10) { }
+    else if (e == 13) {
+      if (c->pos < c->len && c->data[c->pos] == 10) { c->pos = c->pos + 1; }
+    } else if (e >= '0' && e <= '7') {
+      var v: int32 = (int32)(e - '0');
+      var k: int32 = 1;
+      while (k < 3 && c->pos < c->len && c->data[c->pos] >= '0' && c->data[c->pos] <= '7') {
+        v = v * 8 + (int32)(c->data[c->pos] - '0');
+        c->pos = c->pos + 1;
+        k = k + 1;
+      }
+      dxp_buf_put(&b, (uint8)v);
+    } else {
+      dxp_buf_put(&b, e);
+    }
+  }
+  return dxp_pdfr_arena_bytes(a, &b);
+}
+
+fn dxp_pdfr_parse_hex_string(c: DxpPdfCur*, a: Arena*) -> string {
+  if (c->pos < c->len && c->data[c->pos] == '<') { c->pos = c->pos + 1; }
+  var b: DxpBuf;
+  var hi: int32 = -1;
+  while (c->pos < c->len && c->data[c->pos] != '>') {
+    var d: int32 = dxp_pdfr_hex(c->data[c->pos]);
+    c->pos = c->pos + 1;
+    if (d < 0) { continue; }
+    if (hi < 0) { hi = d; }
+    else {
+      dxp_buf_put(&b, (uint8)((hi << 4) | d));
+      hi = -1;
+    }
+  }
+  if (c->pos < c->len) { c->pos = c->pos + 1; }
+  if (hi >= 0) { dxp_buf_put(&b, (uint8)(hi << 4)); }
+  return dxp_pdfr_arena_bytes(a, &b);
+}
+
+fn dxp_pdfr_parse_name(c: DxpPdfCur*, a: Arena*) -> string {
+  if (c->pos < c->len && c->data[c->pos] == '/') { c->pos = c->pos + 1; }
+  var b: DxpBuf;
+  while (c->pos < c->len && !dxp_pdfr_is_delim(c->data[c->pos])) {
+    var ch: uint8 = c->data[c->pos];
+    c->pos = c->pos + 1;
+    if (ch == '#' && c->pos + 2 <= c->len) {
+      var h1: int32 = dxp_pdfr_hex(c->data[c->pos]);
+      var h2: int32 = dxp_pdfr_hex(c->data[c->pos + 1]);
+      if (h1 >= 0 && h2 >= 0) {
+        dxp_buf_put(&b, (uint8)((h1 << 4) | h2));
+        c->pos = c->pos + 2;
+        continue;
+      }
+    }
+    dxp_buf_put(&b, ch);
+  }
+  return dxp_pdfr_arena_bytes(a, &b);
+}
+
+fn dxp_pdfr_parse_number(c: DxpPdfCur*, is_int: bool*, ival: int64*, fval: float64*) -> bool {
+  dxp_pdfr_skip_ws(c);
+  var start: int64 = c->pos;
+  if (c->pos < c->len && (c->data[c->pos] == '+' || c->data[c->pos] == '-')) {
+    c->pos = c->pos + 1;
+  }
+  var digits: int32 = 0;
+  var dot: bool = false;
+  while (c->pos < c->len) {
+    var ch: uint8 = c->data[c->pos];
+    if (ch >= '0' && ch <= '9') {
+      digits = digits + 1;
+      c->pos = c->pos + 1;
+    } else if (ch == '.' && !dot) {
+      dot = true;
+      c->pos = c->pos + 1;
+    } else {
+      break;
+    }
+  }
+  if (digits == 0) { c->pos = start; return false; }
+  var s: string;
+  s.chars = c->data + start;
+  s.length = (uint64)(c->pos - start);
+  *is_int = !dot;
+  if (dot) {
+    *fval = dxp_pdfr_atof(s);
+    *ival = (int64)*fval;
+  } else {
+    *ival = str_to_i64_or(s, 0);
+    *fval = (float64)*ival;
+  }
+  return true;
+}
+
+// Small decimal parser; PDF numbers are ASCII.
+fn dxp_pdfr_atof(s: string) -> float64 {
+  var i: int64 = 0;
+  var neg: bool = false;
+  if (i < (int64)s.length && (s.chars[i] == '+' || s.chars[i] == '-')) {
+    neg = s.chars[i] == '-';
+    i = i + 1;
+  }
+  var v: float64 = 0.0;
+  while (i < (int64)s.length && s.chars[i] >= '0' && s.chars[i] <= '9') {
+    v = v * 10.0 + (float64)(s.chars[i] - '0');
+    i = i + 1;
+  }
+  if (i < (int64)s.length && s.chars[i] == '.') {
+    i = i + 1;
+    var scale: float64 = 0.1;
+    while (i < (int64)s.length && s.chars[i] >= '0' && s.chars[i] <= '9') {
+      v = v + (float64)(s.chars[i] - '0') * scale;
+      scale = scale * 0.1;
+      i = i + 1;
+    }
+  }
+  if (neg) { v = -v; }
+  return v;
+}
+
+fn dxp_pdfr_parse_val(c: DxpPdfCur*, a: Arena*, depth: int32) -> DxpPdfVal* {
+  if (depth > 64) { return 0; }
+  dxp_pdfr_skip_ws(c);
+  if (c->pos >= c->len) { return 0; }
+  var ch: uint8 = c->data[c->pos];
+  if (ch == '(') {
+    var v: DxpPdfVal* = dxp_pdfr_val_new(a, DXP_PDF_STRING);
+    v->s = dxp_pdfr_parse_literal_string(c, a);
+    return v;
+  }
+  if (ch == '<') {
+    if (c->pos + 1 < c->len && c->data[c->pos + 1] == '<') {
+      c->pos = c->pos + 2;
+      var d: DxpPdfVal* = dxp_pdfr_val_new(a, DXP_PDF_DICT);
+      while (c->pos < c->len) {
+        dxp_pdfr_skip_ws(c);
+        if (c->pos + 1 < c->len && c->data[c->pos] == '>' && c->data[c->pos + 1] == '>') {
+          c->pos = c->pos + 2;
+          break;
+        }
+        if (c->pos >= c->len || c->data[c->pos] != '/') {
+          c->pos = c->pos + 1;
+          continue;
+        }
+        var key: string = dxp_pdfr_parse_name(c, a);
+        var val: DxpPdfVal* = dxp_pdfr_parse_val(c, a, depth + 1);
+        if (val == 0) { break; }
+        var e: DxpPdfDictEntry;
+        e.key = key;
+        e.val = val;
+        dxp_vec_push<DxpPdfDictEntry>(&d->dict, e);
+      }
+      return d;
+    }
+    var hv: DxpPdfVal* = dxp_pdfr_val_new(a, DXP_PDF_STRING);
+    hv->s = dxp_pdfr_parse_hex_string(c, a);
+    return hv;
+  }
+  if (ch == '/') {
+    var nv: DxpPdfVal* = dxp_pdfr_val_new(a, DXP_PDF_NAME);
+    nv->s = dxp_pdfr_parse_name(c, a);
+    return nv;
+  }
+  if (ch == '[') {
+    c->pos = c->pos + 1;
+    var av: DxpPdfVal* = dxp_pdfr_val_new(a, DXP_PDF_ARRAY);
+    while (c->pos < c->len) {
+      dxp_pdfr_skip_ws(c);
+      if (c->pos < c->len && c->data[c->pos] == ']') {
+        c->pos = c->pos + 1;
+        break;
+      }
+      var item: DxpPdfVal* = dxp_pdfr_parse_val(c, a, depth + 1);
+      if (item == 0) { break; }
+      dxp_vec_push<DxpPdfVal*>(&av->arr, item);
+    }
+    return av;
+  }
+  if (ch == '+' || ch == '-' || ch == '.' || (ch >= '0' && ch <= '9')) {
+    var is_int: bool = false;
+    var iv: int64 = 0;
+    var fv: float64 = 0.0;
+    var save: int64 = c->pos;
+    if (!dxp_pdfr_parse_number(c, &is_int, &iv, &fv)) { return 0; }
+    if (is_int) {
+      var after_num: int64 = c->pos;
+      dxp_pdfr_skip_ws(c);
+      var is_int2: bool = false;
+      var gen: int64 = 0;
+      var fv2: float64 = 0.0;
+      if (dxp_pdfr_parse_number(c, &is_int2, &gen, &fv2) && is_int2) {
+        dxp_pdfr_skip_ws(c);
+        if (c->pos < c->len && c->data[c->pos] == 'R' &&
+            (c->pos + 1 >= c->len || dxp_pdfr_is_delim(c->data[c->pos + 1]))) {
+          c->pos = c->pos + 1;
+          var rv: DxpPdfVal* = dxp_pdfr_val_new(a, DXP_PDF_REF);
+          rv->ref_num = (int32)iv;
+          rv->n = gen;
+          return rv;
+        }
+      }
+      c->pos = after_num;
+      var nv2: DxpPdfVal* = dxp_pdfr_val_new(a, DXP_PDF_INT);
+      nv2->n = iv;
+      nv2->f = fv;
+      return nv2;
+    }
+    var rv2: DxpPdfVal* = dxp_pdfr_val_new(a, DXP_PDF_REAL);
+    rv2->n = iv;
+    rv2->f = fv;
+    return rv2;
+  }
+  // Keywords.
+  var ks: int64 = c->pos;
+  while (c->pos < c->len && !dxp_pdfr_is_delim(c->data[c->pos])) { c->pos = c->pos + 1; }
+  var kw: string;
+  kw.chars = c->data + ks;
+  kw.length = (uint64)(c->pos - ks);
+  if (kw == "true" || kw == "false") {
+    var bv: DxpPdfVal* = dxp_pdfr_val_new(a, DXP_PDF_BOOL);
+    bv->b = kw == "true";
+    return bv;
+  }
+  var nul: DxpPdfVal* = dxp_pdfr_val_new(a, DXP_PDF_NULL);
+  return nul;
+}
+
+fn dxp_pdfr_dict_get(d: DxpPdfVal*, key: string) -> DxpPdfVal* {
+  if (d == 0 || d->kind != DXP_PDF_DICT) { return 0; }
+  for i in 0..d->dict.length {
+    if (d->dict.data[i].key == key) { return d->dict.data[i].val; }
+  }
+  return 0;
+}
+
+fn dxp_pdfr_name_is(v: DxpPdfVal*, name: string) -> bool {
+  return v != 0 && v->kind == DXP_PDF_NAME && v->s == name;
+}
+
+fn dxp_pdfr_num(v: DxpPdfVal*, fallback: float64) -> float64 {
+  if (v == 0) { return fallback; }
+  if (v->kind == DXP_PDF_INT || v->kind == DXP_PDF_REAL) { return v->f; }
+  return fallback;
+}
+
+fn dxp_pdfr_int(v: DxpPdfVal*, fallback: int64) -> int64 {
+  if (v == 0) { return fallback; }
+  if (v->kind == DXP_PDF_INT || v->kind == DXP_PDF_REAL) { return v->n; }
+  return fallback;
+}
+
+fn dxp_pdfr_find_obj(f: DxpPdfFile*, num: int32) -> DxpPdfObj* {
+  for i in 0..f->objs.length {
+    if (f->objs.data[i].num == num) { return &f->objs.data[i]; }
+  }
+  return 0;
+}
+
+fn dxp_pdfr_resolve(f: DxpPdfFile*, v: DxpPdfVal*) -> DxpPdfVal* {
+  var guard: int32 = 0;
+  while (v != 0 && v->kind == DXP_PDF_REF && guard < 16) {
+    var o: DxpPdfObj* = dxp_pdfr_find_obj(f, v->ref_num);
+    if (o == 0) { return 0; }
+    v = o->val;
+    guard = guard + 1;
+  }
+  return v;
+}
+
+fn dxp_pdfr_keyword_at(c: DxpPdfCur*, kw: string) -> bool {
+  if (c->pos + (int64)kw.length > c->len) { return false; }
+  var i: int64 = 0;
+  while (i < (int64)kw.length) {
+    if (c->data[c->pos + i] != kw.chars[i]) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn dxp_pdfr_parse_objects(f: DxpPdfFile*) {
+  var c: DxpPdfCur;
+  c.data = f->data;
+  c.len = f->len;
+  c.pos = 0;
+  while (c.pos < c.len) {
+    dxp_pdfr_skip_ws(&c);
+    if (c.pos >= c.len) { break; }
+    var save: int64 = c.pos;
+    var is_int: bool = false;
+    var num: int64 = 0;
+    var fv: float64 = 0.0;
+    if (!dxp_pdfr_parse_number(&c, &is_int, &num, &fv) || !is_int) {
+      c.pos = save + 1;
+      continue;
+    }
+    var after_num: int64 = c.pos;
+    dxp_pdfr_skip_ws(&c);
+    var is_gen: bool = false;
+    var gen: int64 = 0;
+    var gf: float64 = 0.0;
+    if (!dxp_pdfr_parse_number(&c, &is_gen, &gen, &gf) || !is_gen) {
+      c.pos = save + 1;
+      continue;
+    }
+    dxp_pdfr_skip_ws(&c);
+    if (!dxp_pdfr_keyword_at(&c, "obj")) {
+      c.pos = save + 1;
+      continue;
+    }
+    c.pos = c.pos + 3;
+    var val: DxpPdfVal* = dxp_pdfr_parse_val(&c, f->arena, 0);
+    if (val == 0) {
+      c.pos = save + 1;
+      continue;
+    }
+    var o: DxpPdfObj;
+    o.num = (int32)num;
+    o.val = val;
+    o.has_stream = false;
+    o.stream_start = 0;
+    o.stream_len = 0;
+    dxp_pdfr_skip_ws(&c);
+    if (dxp_pdfr_keyword_at(&c, "stream")) {
+      c.pos = c.pos + 6;
+      if (c.pos < c.len && c.data[c.pos] == 13) { c.pos = c.pos + 1; }
+      if (c.pos < c.len && c.data[c.pos] == 10) { c.pos = c.pos + 1; }
+      var start: int64 = c.pos;
+      var slen: int64 = -1;
+      var lv: DxpPdfVal* = dxp_pdfr_dict_get(val, "Length");
+      if (lv != 0 && lv->kind == DXP_PDF_INT) {
+        slen = lv->n;
+      } else if (lv != 0 && lv->kind == DXP_PDF_REF) {
+        var lo: DxpPdfObj* = dxp_pdfr_find_obj(f, lv->ref_num);
+        if (lo != 0 && lo->val != 0 && lo->val->kind == DXP_PDF_INT) {
+          slen = lo->val->n;
+        }
+      }
+      var end: int64 = -1;
+      if (slen >= 0 && start + slen <= c.len) {
+        end = start + slen;
+      } else {
+        var k: int64 = start;
+        while (k + 9 <= c.len) {
+          if (c.data[k] == 'e' && c.data[k + 1] == 'n' && c.data[k + 2] == 'd' &&
+              c.data[k + 3] == 's' && c.data[k + 4] == 't' && c.data[k + 5] == 'r' &&
+              c.data[k + 6] == 'e' && c.data[k + 7] == 'a' && c.data[k + 8] == 'm') {
+            end = k;
+            while (end > start && (c.data[end - 1] == 10 || c.data[end - 1] == 13)) {
+              end = end - 1;
+            }
+            break;
+          }
+          k = k + 1;
+        }
+      }
+      if (end >= start) {
+        o.has_stream = true;
+        o.stream_start = start;
+        o.stream_len = end - start;
+        c.pos = end;
+        if (dxp_pdfr_keyword_at(&c, "endstream")) { c.pos = c.pos + 9; }
+      }
+    }
+    dxp_vec_push<DxpPdfObj>(&f->objs, o);
+    dxp_pdfr_skip_ws(&c);
+    if (dxp_pdfr_keyword_at(&c, "endobj")) { c.pos = c.pos + 6; }
+    if (c.pos <= save) { c.pos = save + 1; }
+  }
+}
+
+fn dxp_pdfr_ascii_hex(raw: uint8*, n: int64, out: DxpBuf*) {
+  var hi: int32 = -1;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: uint8 = raw[i];
+    i = i + 1;
+    if (c == '>') { break; }
+    var d: int32 = dxp_pdfr_hex(c);
+    if (d < 0) { continue; }
+    if (hi < 0) { hi = d; }
+    else { dxp_buf_put(out, (uint8)((hi << 4) | d)); hi = -1; }
+  }
+  if (hi >= 0) { dxp_buf_put(out, (uint8)(hi << 4)); }
+}
+
+fn dxp_pdfr_ascii85(raw: uint8*, n: int64, out: DxpBuf*) {
+  var tuple: int32[5];
+  var count: int32 = 0;
+  var i: int64 = 0;
+  if (n >= 2 && raw[0] == '<' && raw[1] == '~') { i = 2; }
+  while (i < n) {
+    var c: uint8 = raw[i];
+    i = i + 1;
+    if (c == '~') { break; }
+    if (c == 'z' && count == 0) {
+      dxp_buf_put(out, 0); dxp_buf_put(out, 0);
+      dxp_buf_put(out, 0); dxp_buf_put(out, 0);
+      continue;
+    }
+    if (c < 33 || c > 117) { continue; }
+    tuple[count] = (int32)(c - 33);
+    count = count + 1;
+    if (count == 5) {
+      var v: uint32 = 0;
+      for k in 0..5 { v = v * 85 + (uint32)tuple[k]; }
+      dxp_buf_put(out, (uint8)((v >> 24) & 255));
+      dxp_buf_put(out, (uint8)((v >> 16) & 255));
+      dxp_buf_put(out, (uint8)((v >> 8) & 255));
+      dxp_buf_put(out, (uint8)(v & 255));
+      count = 0;
+    }
+  }
+  if (count > 0) {
+    var k: int32 = count;
+    while (k < 5) { tuple[k] = 84; k = k + 1; }
+    var v: uint32 = 0;
+    for k in 0..5 { v = v * 85 + (uint32)tuple[k]; }
+    var bytes: int32 = count - 1;
+    if (bytes > 0) { dxp_buf_put(out, (uint8)((v >> 24) & 255)); }
+    if (bytes > 1) { dxp_buf_put(out, (uint8)((v >> 16) & 255)); }
+    if (bytes > 2) { dxp_buf_put(out, (uint8)((v >> 8) & 255)); }
+    if (bytes > 3) { dxp_buf_put(out, (uint8)(v & 255)); }
+  }
+}
+
+fn dxp_pdfr_runlength(raw: uint8*, n: int64, out: DxpBuf*) {
+  var i: int64 = 0;
+  while (i < n) {
+    var l: int32 = (int32)raw[i];
+    i = i + 1;
+    if (l == 128) { break; }
+    if (l < 128) {
+      var k: int32 = 0;
+      while (k <= l && i < n) {
+        dxp_buf_put(out, raw[i]);
+        i = i + 1;
+        k = k + 1;
+      }
+    } else {
+      if (i < n) {
+        var b: uint8 = raw[i];
+        i = i + 1;
+        var k: int32 = 0;
+        while (k < 257 - l) { dxp_buf_put(out, b); k = k + 1; }
+      }
+    }
+  }
+}
+
+fn dxp_pdfr_decode_stream(f: DxpPdfFile*, o: DxpPdfObj*, out: DxpBuf*) -> int32 {
+  if (o == 0 || !o->has_stream) { return -1; }
+  var filter: DxpPdfVal* = dxp_pdfr_dict_get(o->val, "Filter");
+  if (filter == 0) {
+    return dxp_buf_append(out, f->data + o->stream_start, o->stream_len);
+  }
+  var raw: uint8* = f->data + o->stream_start;
+  var raw_len: int64 = o->stream_len;
+  var tmp: DxpBuf;
+  if (filter->kind == DXP_PDF_NAME) {
+    if (filter->s == "FlateDecode" || filter->s == "Fl") {
+      var pb: PressBuf;
+      var rc: int32 = press_zlib_decompress(raw, raw_len, &pb);
+      if (rc != PRESS_OK) { press_buf_free(&pb); return -2; }
+      dxp_buf_append(out, pb.data, pb.len);
+      press_buf_free(&pb);
+      return 0;
+    }
+    if (filter->s == "ASCIIHexDecode" || filter->s == "AHx") {
+      var b: DxpBuf;
+      dxp_pdfr_ascii_hex(raw, raw_len, &b);
+      dxp_buf_append(out, b.data, b.len);
+      dxp_buf_free(&b);
+      return 0;
+    }
+    if (filter->s == "ASCII85Decode" || filter->s == "A85") {
+      var b2: DxpBuf;
+      dxp_pdfr_ascii85(raw, raw_len, &b2);
+      dxp_buf_append(out, b2.data, b2.len);
+      dxp_buf_free(&b2);
+      return 0;
+    }
+    if (filter->s == "RunLengthDecode" || filter->s == "RL") {
+      var b3: DxpBuf;
+      dxp_pdfr_runlength(raw, raw_len, &b3);
+      dxp_buf_append(out, b3.data, b3.len);
+      dxp_buf_free(&b3);
+      return 0;
+    }
+    return -3;
+  }
+  if (filter->kind == DXP_PDF_ARRAY) {
+    // Most files use one filter. Apply the first supported one.
+    for i in 0..filter->arr.length {
+      var fv: DxpPdfVal* = filter->arr.data[i];
+      if (fv->kind != DXP_PDF_NAME) { continue; }
+      if (fv->s == "FlateDecode" || fv->s == "Fl") {
+        var pb2: PressBuf;
+        var rc2: int32 = press_zlib_decompress(raw, raw_len, &pb2);
+        if (rc2 != PRESS_OK) { press_buf_free(&pb2); return -2; }
+        dxp_buf_append(out, pb2.data, pb2.len);
+        press_buf_free(&pb2);
+        return 0;
+      }
+    }
+  }
+  return -4;
+}
+
+fn dxp_pdfr_expand_objstms(f: DxpPdfFile*) {
+  var n0: int64 = f->objs.length;
+  var i: int64 = 0;
+  while (i < n0) {
+    var o: DxpPdfObj* = &f->objs.data[i];
+    var typ: DxpPdfVal* = dxp_pdfr_dict_get(o->val, "Type");
+    if (dxp_pdfr_name_is(typ, "ObjStm") && o->has_stream) {
+      var b: DxpBuf;
+      if (dxp_pdfr_decode_stream(f, o, &b) == 0) {
+        var n: int64 = dxp_pdfr_int(dxp_pdfr_dict_get(o->val, "N"), 0);
+        var first: int64 = dxp_pdfr_int(dxp_pdfr_dict_get(o->val, "First"), 0);
+        var c: DxpPdfCur;
+        c.data = b.data;
+        c.len = b.len;
+        c.pos = 0;
+        var k: int64 = 0;
+        while (k < n && c.pos < c.len) {
+          var is_i: bool = false;
+          var onum: int64 = 0;
+          var off: int64 = 0;
+          var ff: float64 = 0.0;
+          if (!dxp_pdfr_parse_number(&c, &is_i, &onum, &ff)) { break; }
+          if (!dxp_pdfr_parse_number(&c, &is_i, &off, &ff)) { break; }
+          var vc: DxpPdfCur;
+          vc.data = b.data;
+          vc.len = b.len;
+          vc.pos = first + off;
+          var vv: DxpPdfVal* = dxp_pdfr_parse_val(&vc, f->arena, 0);
+          if (vv != 0 && dxp_pdfr_find_obj(f, (int32)onum) == 0) {
+            var no: DxpPdfObj;
+            no.num = (int32)onum;
+            no.val = vv;
+            no.has_stream = false;
+            no.stream_start = 0;
+            no.stream_len = 0;
+            dxp_vec_push<DxpPdfObj>(&f->objs, no);
+          }
+          k = k + 1;
+        }
+      }
+      dxp_buf_free(&b);
+    }
+    i = i + 1;
+  }
+}
+
+fn dxp_pdfr_find_root(f: DxpPdfFile*) -> DxpPdfVal* {
+  for i in 0..f->objs.length {
+    var o: DxpPdfObj* = &f->objs.data[i];
+    var typ: DxpPdfVal* = dxp_pdfr_dict_get(o->val, "Type");
+    if (dxp_pdfr_name_is(typ, "Catalog")) { return o->val; }
+  }
+  // Fall back to a /Root reference in the raw file.
+  var pos: int64 = 0;
+  while (pos + 5 < f->len) {
+    if (f->data[pos] == '/' && f->data[pos + 1] == 'R' && f->data[pos + 2] == 'o' &&
+        f->data[pos + 3] == 'o' && f->data[pos + 4] == 't') {
+      var c: DxpPdfCur;
+      c.data = f->data;
+      c.len = f->len;
+      c.pos = pos + 5;
+      var v: DxpPdfVal* = dxp_pdfr_parse_val(&c, f->arena, 0);
+      if (v != 0 && v->kind == DXP_PDF_REF) {
+        return dxp_pdfr_resolve(f, v);
+      }
+    }
+    pos = pos + 1;
+  }
+  return 0;
+}
+
+fn dxp_pdfr_utf8_put(out: DxpBuf*, cp: uint32) {
+  if (cp < 128) { dxp_buf_put(out, (uint8)cp); }
+  else if (cp < 2048) {
+    dxp_buf_put(out, (uint8)(192 + (cp >> 6)));
+    dxp_buf_put(out, (uint8)(128 + (cp & 63)));
+  } else if (cp < 65536) {
+    dxp_buf_put(out, (uint8)(224 + (cp >> 12)));
+    dxp_buf_put(out, (uint8)(128 + ((cp >> 6) & 63)));
+    dxp_buf_put(out, (uint8)(128 + (cp & 63)));
+  } else {
+    dxp_buf_put(out, (uint8)(240 + (cp >> 18)));
+    dxp_buf_put(out, (uint8)(128 + ((cp >> 12) & 63)));
+    dxp_buf_put(out, (uint8)(128 + ((cp >> 6) & 63)));
+    dxp_buf_put(out, (uint8)(128 + (cp & 63)));
+  }
+}
+
+fn dxp_pdfr_utf16be(a: Arena*, s: string) -> string {
+  var out: DxpBuf;
+  var i: int64 = 0;
+  while (i + 1 < (int64)s.length) {
+    var u: uint32 = ((uint32)s.chars[i] << 8) | (uint32)s.chars[i + 1];
+    i = i + 2;
+    if (u >= 0xD800 && u <= 0xDBFF && i + 1 < (int64)s.length) {
+      var lo: uint32 = ((uint32)s.chars[i] << 8) | (uint32)s.chars[i + 1];
+      if (lo >= 0xDC00 && lo <= 0xDFFF) {
+        u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+        i = i + 2;
+      }
+    }
+    dxp_pdfr_utf8_put(&out, u);
+  }
+  var res: string = dxp_str_dup_arena(a, dxp_buf_view(&out));
+  dxp_buf_free(&out);
+  return res;
+}
+
+fn dxp_pdfr_cmap_add(c: DxpPdfCMap*, lo: int64, hi: int64, dst: string, src_bytes: int32) {
+  var r: DxpPdfCMapRange;
+  r.lo = lo;
+  r.hi = hi;
+  r.dst = dst;
+  r.src_bytes = src_bytes;
+  dxp_vec_push<DxpPdfCMapRange>(&c->ranges, r);
+}
+
+fn dxp_pdfr_range_dst(a: Arena*, hex: string, offset: int64) -> string {
+  if (hex.length < 2) { return ""; }
+  var last: int64 = (int64)hex.length - 2;
+  var u: uint32 = ((uint32)hex.chars[last] << 8) | (uint32)hex.chars[last + 1];
+  u = u + (uint32)offset;
+  if (u > 0x10FFFF) { u = 0xFFFD; }
+  var b: DxpBuf;
+  dxp_pdfr_utf8_put(&b, u);
+  var s: string = dxp_str_dup_arena(a, dxp_buf_view(&b));
+  dxp_buf_free(&b);
+  return s;
+}
+
+fn dxp_pdfr_parse_cmap(data: uint8*, len: int64, a: Arena*) -> DxpPdfCMap {
+  var m: DxpPdfCMap;
+  m.ranges = dxp_vec_init<DxpPdfCMapRange>();
+  var c: DxpPdfCur;
+  c.data = data;
+  c.len = len;
+  c.pos = 0;
+  while (c.pos < c.len) {
+    dxp_pdfr_skip_ws(&c);
+    if (c.pos >= c.len) { break; }
+    var ch: uint8 = c.data[c.pos];
+    if (ch == '<') {
+      // Hex strings outside bfchar/bfrange are codespace declarations.
+      dxp_pdfr_parse_hex_string(&c, a);
+    } else if (ch == 'b') {
+      // beginbfchar / beginbfrange
+      var ks: int64 = c.pos;
+      while (c.pos < c.len && !dxp_pdfr_is_delim(c.data[c.pos])) { c.pos = c.pos + 1; }
+      var kw: string;
+      kw.chars = c.data + ks;
+      kw.length = (uint64)(c.pos - ks);
+      if (kw == "beginbfchar") {
+        while (true) {
+          dxp_pdfr_skip_ws(&c);
+          if (c.pos >= c.len || c.data[c.pos] != '<') { break; }
+          var src: string = dxp_pdfr_parse_hex_string(&c, a);
+          dxp_pdfr_skip_ws(&c);
+          if (c.pos >= c.len) { break; }
+          var dst2: string = "";
+          if (c.data[c.pos] == '<') {
+            var ds: string = dxp_pdfr_parse_hex_string(&c, a);
+            dst2 = dxp_pdfr_utf16be(a, ds);
+          } else if (c.data[c.pos] == '/') {
+            var nm: string = dxp_pdfr_parse_name(&c, a);
+            dst2 = dxp_pdfr_glyph_unicode(nm, a);
+          } else {
+            break;
+          }
+          var lo2: int64 = 0;
+          var k2: int64 = 0;
+          while (k2 < (int64)src.length) { lo2 = (lo2 << 8) | (int64)src.chars[k2]; k2 = k2 + 1; }
+          dxp_pdfr_cmap_add(&m, lo2, lo2, dst2, (int32)src.length);
+        }
+      } else if (kw == "beginbfrange") {
+        while (true) {
+          dxp_pdfr_skip_ws(&c);
+          if (c.pos >= c.len || c.data[c.pos] != '<') { break; }
+          var slo: string = dxp_pdfr_parse_hex_string(&c, a);
+          dxp_pdfr_skip_ws(&c);
+          if (c.pos >= c.len || c.data[c.pos] != '<') {
+            // Some CMaps put an integer bound.
+            var is_i: bool = false;
+            var iv: int64 = 0;
+            var ff: float64 = 0.0;
+            if (!dxp_pdfr_parse_number(&c, &is_i, &iv, &ff)) { break; }
+          }
+          var shi: string = "";
+          if (c.data[c.pos] == '<') { shi = dxp_pdfr_parse_hex_string(&c, a); }
+          var lo3: int64 = 0;
+          var hi3: int64 = 0;
+          var k3: int64 = 0;
+          while (k3 < (int64)slo.length) { lo3 = (lo3 << 8) | (int64)slo.chars[k3]; k3 = k3 + 1; }
+          k3 = 0;
+          while (k3 < (int64)shi.length) { hi3 = (hi3 << 8) | (int64)shi.chars[k3]; k3 = k3 + 1; }
+          if (hi3 < lo3) { hi3 = lo3; }
+          dxp_pdfr_skip_ws(&c);
+          if (c.pos < c.len && c.data[c.pos] == '[') {
+            c.pos = c.pos + 1;
+            var code: int64 = lo3;
+            while (c.pos < c.len) {
+              dxp_pdfr_skip_ws(&c);
+              if (c.data[c.pos] == ']') { c.pos = c.pos + 1; break; }
+              if (c.data[c.pos] != '<') { break; }
+              var ds2: string = dxp_pdfr_parse_hex_string(&c, a);
+              dxp_pdfr_cmap_add(&m, code, code, dxp_pdfr_utf16be(a, ds2), (int32)slo.length);
+              code = code + 1;
+            }
+          } else if (c.pos < c.len && c.data[c.pos] == '<') {
+            var ds3: string = dxp_pdfr_parse_hex_string(&c, a);
+            if (hi3 - lo3 <= 65535) {
+              var code2: int64 = lo3;
+              while (code2 <= hi3) {
+                var ubase: string = dxp_pdfr_range_dst(a, ds3, code2 - lo3);
+                dxp_pdfr_cmap_add(&m, code2, code2, ubase, (int32)slo.length);
+                code2 = code2 + 1;
+              }
+            }
+          } else {
+            break;
+          }
+        }
+      }
+    } else {
+      c.pos = c.pos + 1;
+    }
+  }
+  return m;
+}
+
+fn dxp_pdfr_glyph_unicode(name: string, a: Arena*) -> string {
+  if (name.length > 3 && dxp_ascii_starts(name, "uni")) {
+    var tmp: uint8[2];
+    var v: int32 = 0;
+    var i: int64 = 3;
+    var n: int32 = 0;
+    while (i < (int64)name.length && n < 4) {
+      var d: int32 = dxp_pdfr_hex(name.chars[i]);
+      if (d < 0) { break; }
+      v = v * 16 + d;
+      i = i + 1;
+      n = n + 1;
+    }
+    var b: DxpBuf;
+    dxp_pdfr_utf8_put(&b, (uint32)v);
+    var s: string = dxp_str_dup_arena(a, dxp_buf_view(&b));
+    dxp_buf_free(&b);
+    return s;
+  }
+  if (name == "space") { return " "; }
+  if (name == "exclam") { return "!"; }
+  if (name == "quotedbl") { return "\""; }
+  if (name == "numbersign") { return "#"; }
+  if (name == "dollar") { return "$"; }
+  if (name == "percent") { return "%"; }
+  if (name == "ampersand") { return "&"; }
+  if (name == "quotesingle") { return "'"; }
+  if (name == "parenleft") { return "("; }
+  if (name == "parenright") { return ")"; }
+  if (name == "asterisk") { return "*"; }
+  if (name == "plus") { return "+"; }
+  if (name == "comma") { return ","; }
+  if (name == "hyphen" || name == "minus") { return "-"; }
+  if (name == "period") { return "."; }
+  if (name == "slash") { return "/"; }
+  if (name == "zero") { return "0"; }
+  if (name == "one") { return "1"; }
+  if (name == "two") { return "2"; }
+  if (name == "three") { return "3"; }
+  if (name == "four") { return "4"; }
+  if (name == "five") { return "5"; }
+  if (name == "six") { return "6"; }
+  if (name == "seven") { return "7"; }
+  if (name == "eight") { return "8"; }
+  if (name == "nine") { return "9"; }
+  if (name == "colon") { return ":"; }
+  if (name == "semicolon") { return ";"; }
+  if (name == "less") { return "<"; }
+  if (name == "equal") { return "="; }
+  if (name == "greater") { return ">"; }
+  if (name == "question") { return "?"; }
+  if (name == "at") { return "@"; }
+  if (name == "bracketleft") { return "["; }
+  if (name == "backslash") { return "\\"; }
+  if (name == "bracketright") { return "]"; }
+  if (name == "asciicircum") { return "^"; }
+  if (name == "underscore") { return "_"; }
+  if (name == "grave") { return "`"; }
+  if (name == "braceleft") { return "{{"; }
+  if (name == "bar") { return "|"; }
+  if (name == "braceright") { return "}"; }
+  if (name == "asciitilde") { return "~"; }
+  if (name == "quoteleft") { return "`"; }
+  if (name == "quoteright") { return "'"; }
+  if (name == "quotedblleft") { return "\""; }
+  if (name == "quotedblright") { return "\""; }
+  if (name == "endash") { return "-"; }
+  if (name == "emdash") { return "-"; }
+  if (name == "bullet") { return "-"; }
+  if (name == "ellipsis") { return "..."; }
+  if (name == "fi") { return "fi"; }
+  if (name == "fl") { return "fl"; }
+  if (name == "ff") { return "ff"; }
+  if (name == "ffi") { return "ffi"; }
+  if (name == "ffl") { return "ffl"; }
+  if (name.length == 1) { return dxp_str_dup_arena(a, name); }
+  return "?";
+}
+
+fn dxp_ascii_starts(s: string, p: string) -> bool {
+  if (p.length > s.length) { return false; }
+  var i: int64 = 0;
+  while (i < (int64)p.length) {
+    if (s.chars[i] != p.chars[i]) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn dxp_pdfr_cmap_lookup(m: DxpPdfCMap*, code: int64, a: Arena*) -> string {
+  for i in 0..m->ranges.length {
+    var r: DxpPdfCMapRange* = &m->ranges.data[i];
+    if (code >= r->lo && code <= r->hi) {
+      return dxp_str_dup_arena(a, r->dst);
+    }
+  }
+  return "";
+}
+
+fn dxp_pdfr_byte_unicode(b: uint8, a: Arena*) -> string {
+  var cp: uint32 = (uint32)b;
+  if (b >= 128 && b <= 159) {
+    // WinAnsi punctuation.
+    var map: uint32[32] = [
+      0x20AC,0,0x201A,0x0192,0x201E,0x2026,0x2020,0x2021,
+      0x02C6,0x2030,0x0160,0x2039,0x0152,0,0x017D,0,
+      0,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,
+      0x02DC,0x2122,0x0161,0x203A,0x0153,0,0x017E,0x0178
+    ];
+    cp = map[(int64)b - 128];
+    if (cp == 0) { cp = 63; }
+  }
+  var out: DxpBuf;
+  dxp_pdfr_utf8_put(&out, cp);
+  var s: string = dxp_str_dup_arena(a, dxp_buf_view(&out));
+  dxp_buf_free(&out);
+  return s;
+}
+
+fn dxp_pdfr_font_diff(f: DxpPdfFont*, code: int32) -> string {
+  for i in 0..f->diffs.length {
+    if (f->diffs.data[i].code == code) { return f->diffs.data[i].name; }
+  }
+  return "";
+}
+
+fn dxp_pdfr_decode_text(f: DxpPdfFile*, font: DxpPdfFont*, s: string) -> string {
+  var out: DxpBuf;
+  if (font->has_cmap) {
+    var i: int64 = 0;
+    var width: int32 = 1;
+    if (font->is_cid) { width = 2; }
+    while (i < (int64)s.length) {
+      var code: int64 = 0;
+      var k: int32 = 0;
+      while (k < width && i < (int64)s.length) {
+        code = (code << 8) | (int64)s.chars[i];
+        i = i + 1;
+        k = k + 1;
+      }
+      var u: string = dxp_pdfr_cmap_lookup(&font->cmap, code, f->arena);
+      if (u.length == 0) {
+        // A one-byte fallback keeps text visible when a CMap is partial.
+        u = dxp_pdfr_byte_unicode((uint8)code, f->arena);
+      }
+      dxp_buf_puts(&out, u);
+    }
+  } else if (font->is_cid) {
+    var i: int64 = 0;
+    while (i + 1 < (int64)s.length) {
+      var code: int32 = ((int32)s.chars[i] << 8) | (int32)s.chars[i + 1];
+      i = i + 2;
+      var nm: string = dxp_pdfr_font_diff(font, code);
+      if (nm.length > 0) { dxp_buf_puts(&out, dxp_pdfr_glyph_unicode(nm, f->arena)); }
+      else { dxp_buf_put(&out, (uint8)code); }
+    }
+  } else {
+    var i: int64 = 0;
+    while (i < (int64)s.length) {
+      var b: uint8 = s.chars[i];
+      i = i + 1;
+      var nm: string = dxp_pdfr_font_diff(font, (int32)b);
+      if (nm.length > 0) { dxp_buf_puts(&out, dxp_pdfr_glyph_unicode(nm, f->arena)); }
+      else { dxp_buf_puts(&out, dxp_pdfr_byte_unicode(b, f->arena)); }
+    }
+  }
+  var res: string = dxp_str_dup_arena(f->arena, dxp_buf_view(&out));
+  dxp_buf_free(&out);
+  return res;
+}
+
+fn dxp_pdfr_font_name_style(name: string) -> int32 {
+  // 1 bold, 2 italic, 3 both.
+  var b: bool = dxp_ascii_icontains2(name, "bold") || dxp_ascii_icontains2(name, "black") ||
+                dxp_ascii_icontains2(name, "heavy");
+  var i: bool = dxp_ascii_icontains2(name, "italic") || dxp_ascii_icontains2(name, "oblique");
+  if (b && i) { return 3; }
+  if (b) { return 1; }
+  if (i) { return 2; }
+  return 0;
+}
+
+fn dxp_ascii_icontains2(s: string, needle: string) -> bool {
+  var n: int64 = (int64)needle.length;
+  var i: int64 = 0;
+  while (i + n <= (int64)s.length) {
+    var ok: bool = true;
+    var j: int64 = 0;
+    while (j < n) {
+      var a: uint8 = s.chars[i + j];
+      var b: uint8 = needle.chars[j];
+      if (a >= 'A' && a <= 'Z') { a = (uint8)(a + 32); }
+      if (b >= 'A' && b <= 'Z') { b = (uint8)(b + 32); }
+      if (a != b) { ok = false; break; }
+      j = j + 1;
+    }
+    if (ok) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn dxp_pdfr_build_font(f: DxpPdfFile*, res_name: string, fv: DxpPdfVal*) -> DxpPdfFont {
+  var font: DxpPdfFont;
+  font.res_name = res_name;
+  font.val = fv;
+  font.is_cid = false;
+  font.cmap.ranges = dxp_vec_init<DxpPdfCMapRange>();
+  font.has_cmap = false;
+  font.encoding = "";
+  font.diffs = dxp_vec_init<DxpPdfCodeName>();
+  font.first_char = 0;
+  font.widths = dxp_vec_init<float64>();
+  font.bold = false;
+  font.italic = false;
+  var fd: DxpPdfVal* = dxp_pdfr_resolve(f, fv);
+  if (fd == 0) { return font; }
+  var sub: DxpPdfVal* = dxp_pdfr_dict_get(fd, "Subtype");
+  if (dxp_pdfr_name_is(sub, "Type0")) { font.is_cid = true; }
+  var bf: DxpPdfVal* = dxp_pdfr_dict_get(fd, "BaseFont");
+  if (bf != 0 && bf->kind == DXP_PDF_NAME) {
+    var st: int32 = dxp_pdfr_font_name_style(bf->s);
+    font.bold = st == 1 || st == 3;
+    font.italic = st == 2 || st == 3;
+  }
+  var tu: DxpPdfVal* = dxp_pdfr_dict_get(fd, "ToUnicode");
+  var tuo: DxpPdfObj* = 0;
+  if (tu != 0 && tu->kind == DXP_PDF_REF) { tuo = dxp_pdfr_find_obj(f, tu->ref_num); }
+  if (tuo != 0 && tuo->has_stream) {
+    var b: DxpBuf;
+    if (dxp_pdfr_decode_stream(f, tuo, &b) == 0) {
+      font.cmap = dxp_pdfr_parse_cmap(b.data, b.len, f->arena);
+      font.has_cmap = font.cmap.ranges.length > 0;
+        }
+    dxp_buf_free(&b);
+  }
+  var enc: DxpPdfVal* = dxp_pdfr_dict_get(fd, "Encoding");
+  if (enc != 0) {
+    if (enc->kind == DXP_PDF_NAME) { font.encoding = enc->s; }
+    else if (enc->kind == DXP_PDF_DICT) {
+      var base: DxpPdfVal* = dxp_pdfr_dict_get(enc, "BaseEncoding");
+      if (base != 0 && base->kind == DXP_PDF_NAME) { font.encoding = base->s; }
+      var diffs: DxpPdfVal* = dxp_pdfr_dict_get(enc, "Differences");
+      if (diffs != 0 && diffs->kind == DXP_PDF_ARRAY) {
+        var code: int32 = 0;
+        for di in 0..diffs->arr.length {
+          var dv: DxpPdfVal* = diffs->arr.data[di];
+          if (dv->kind == DXP_PDF_INT) { code = (int32)dv->n; }
+          else if (dv->kind == DXP_PDF_NAME) {
+            var cn: DxpPdfCodeName;
+            cn.code = code;
+            cn.name = dv->s;
+            dxp_vec_push<DxpPdfCodeName>(&font.diffs, cn);
+            code = code + 1;
+          }
+        }
+      }
+    }
+  }
+  var fc: DxpPdfVal* = dxp_pdfr_dict_get(fd, "FirstChar");
+  if (fc != 0 && fc->kind == DXP_PDF_INT) { font.first_char = (int32)fc->n; }
+  var wv: DxpPdfVal* = dxp_pdfr_resolve(f, dxp_pdfr_dict_get(fd, "Widths"));
+  if (wv != 0 && wv->kind == DXP_PDF_ARRAY) {
+    for i in 0..wv->arr.length {
+      dxp_vec_push<float64>(&font.widths, dxp_pdfr_num(wv->arr.data[i], 500.0));
+    }
+  }
+  return font;
+}
+
+fn dxp_pdfr_build_fonts(f: DxpPdfFile*, resources: DxpPdfVal*, out: DxpVec<DxpPdfFont>*) {
+  var res: DxpPdfVal* = dxp_pdfr_resolve(f, resources);
+  if (res == 0) { return; }
+  var fonts: DxpPdfVal* = dxp_pdfr_dict_get(res, "Font");
+  if (fonts == 0) { return; }
+  fonts = dxp_pdfr_resolve(f, fonts);
+  if (fonts == 0 || fonts->kind != DXP_PDF_DICT) { return; }
+  for i in 0..fonts->dict.length {
+    var e: DxpPdfDictEntry* = &fonts->dict.data[i];
+    var font: DxpPdfFont = dxp_pdfr_build_font(f, e->key, e->val);
+    dxp_vec_push<DxpPdfFont>(out, font);
+  }
+}
+
+fn dxp_pdfr_font_find(fonts: DxpVec<DxpPdfFont>*, name: string) -> DxpPdfFont* {
+  for i in 0..fonts->length {
+    if (fonts->data[i].res_name == name) { return &fonts->data[i]; }
+  }
+  return 0;
+}
+
+fn dxp_pdfr_gstate_init(g: DxpPdfGState*) {
+  g->ctm_a = 1.0; g->ctm_b = 0.0; g->ctm_c = 0.0;
+  g->ctm_d = 1.0; g->ctm_e = 0.0; g->ctm_f = 0.0;
+  g->font_name = "";
+  g->font_size = 12.0;
+  g->leading = 0.0;
+  g->char_space = 0.0;
+  g->word_space = 0.0;
+  g->hscale = 1.0;
+}
+
+fn dxp_pdfr_textstate_init(t: DxpPdfTextState*) {
+  t->tm_a = 1.0; t->tm_b = 0.0; t->tm_c = 0.0;
+  t->tm_d = 1.0; t->tm_e = 0.0; t->tm_f = 0.0;
+  t->lm_a = 1.0; t->lm_b = 0.0; t->lm_c = 0.0;
+  t->lm_d = 1.0; t->lm_e = 0.0; t->lm_f = 0.0;
+  t->in_text = false;
+}
+
+fn dxp_pdfr_matrix_mul(g: DxpPdfGState*, a: float64, b: float64, c: float64,
+                       d: float64, e: float64, f: float64) {
+  var na: float64 = a * g->ctm_a + b * g->ctm_c;
+  var nb: float64 = a * g->ctm_b + b * g->ctm_d;
+  var nc: float64 = c * g->ctm_a + d * g->ctm_c;
+  var nd: float64 = c * g->ctm_b + d * g->ctm_d;
+  var ne: float64 = e * g->ctm_a + f * g->ctm_c + g->ctm_e;
+  var nf: float64 = e * g->ctm_b + f * g->ctm_d + g->ctm_f;
+  g->ctm_a = na; g->ctm_b = nb; g->ctm_c = nc;
+  g->ctm_d = nd; g->ctm_e = ne; g->ctm_f = nf;
+}
+
+fn dxp_pdfr_transform_x(g: DxpPdfGState*, x: float64, y: float64) -> float64 {
+  return x * g->ctm_a + y * g->ctm_c + g->ctm_e;
+}
+
+fn dxp_pdfr_transform_y(g: DxpPdfGState*, x: float64, y: float64) -> float64 {
+  return x * g->ctm_b + y * g->ctm_d + g->ctm_f;
+}
+
+fn dxp_pdfr_text_advance(f: DxpPdfFile*, font: DxpPdfFont*, text: string,
+                         size: float64, char_space: float64, word_space: float64,
+                         hscale: float64) -> float64 {
+  var w: float64 = 0.0;
+  if (font->is_cid) {
+    var chars: int64 = (int64)text.length / 2;
+    w = (float64)chars * 500.0 / 1000.0 * size * hscale;
+    w = w + (float64)chars * char_space;
+    return w;
+  }
+  var i: int64 = 0;
+  while (i < (int64)text.length) {
+    var code: int32 = (int32)text.chars[i];
+    var u: float64 = 500.0;
+    if (font->widths.length > 0) {
+      var idx: int64 = (int64)code - (int64)font->first_char;
+      if (idx >= 0 && idx < font->widths.length) { u = font->widths.data[idx]; }
+    }
+    w = w + u / 1000.0 * size * hscale + char_space;
+    if (code == 32) { w = w + word_space; }
+    i = i + 1;
+  }
+  return w;
+}
+
+fn dxp_pdfr_chunk_add(chunks: DxpVec<DxpPdfChunk>*, f: DxpPdfFile*,
+                      font: DxpPdfFont*, g: DxpPdfGState*, t: DxpPdfTextState*,
+                      page: int32, raw: string) {
+  if (raw.length == 0) { return; }
+  var txt: string = dxp_pdfr_decode_text(f, font, raw);
+  if (txt.length == 0) { return; }
+  var x: float64 = dxp_pdfr_transform_x(g, t->tm_e, t->tm_f);
+  var y: float64 = dxp_pdfr_transform_y(g, t->tm_e, t->tm_f);
+  var c: DxpPdfChunk;
+  c.text = txt;
+  c.x = x;
+  c.y = y;
+  c.size = g->font_size;
+  c.adv = dxp_pdfr_text_advance(f, font, raw, g->font_size, g->char_space, g->word_space, g->hscale);
+  c.bold = font->bold;
+  c.italic = font->italic;
+  c.page = page;
+  dxp_vec_push<DxpPdfChunk>(chunks, c);
+}
+
+fn dxp_pdfr_apply_tj(chunks: DxpVec<DxpPdfChunk>*, f: DxpPdfFile*,
+                     fonts: DxpVec<DxpPdfFont>*, g: DxpPdfGState*,
+                     t: DxpPdfTextState*, page: int32, arr: DxpPdfVal*) {
+  var font: DxpPdfFont* = dxp_pdfr_font_find(fonts, g->font_name);
+  if (font == 0) { return; }
+  if (arr->kind == DXP_PDF_STRING) {
+    dxp_pdfr_chunk_add(chunks, f, font, g, t, page, arr->s);
+    var adv: float64 = dxp_pdfr_text_advance(f, font, arr->s, g->font_size,
+                                             g->char_space, g->word_space, g->hscale);
+    t->tm_e = t->tm_e + adv;
+    return;
+  }
+  if (arr->kind != DXP_PDF_ARRAY) { return; }
+  for i in 0..arr->arr.length {
+    var v: DxpPdfVal* = arr->arr.data[i];
+    if (v->kind == DXP_PDF_STRING) {
+      dxp_pdfr_chunk_add(chunks, f, font, g, t, page, v->s);
+      var adv2: float64 = dxp_pdfr_text_advance(f, font, v->s, g->font_size,
+                                                g->char_space, g->word_space, g->hscale);
+      t->tm_e = t->tm_e + adv2;
+    } else if (v->kind == DXP_PDF_INT || v->kind == DXP_PDF_REAL) {
+      t->tm_e = t->tm_e - v->f / 1000.0 * g->font_size * g->hscale;
+    }
+  }
+}
+
+fn dxp_pdfr_content(f: DxpPdfFile*, data: uint8*, len: int64, page: int32,
+                    fonts: DxpVec<DxpPdfFont>*, chunks: DxpVec<DxpPdfChunk>*) {
+  var c: DxpPdfCur;
+  c.data = data;
+  c.len = len;
+  c.pos = 0;
+  var stack: DxpVec<DxpPdfVal*> = dxp_vec_init<DxpPdfVal*>();
+  var gstates: DxpVec<DxpPdfGState> = dxp_vec_init<DxpPdfGState>();
+  var g: DxpPdfGState;
+  dxp_pdfr_gstate_init(&g);
+  dxp_vec_push<DxpPdfGState>(&gstates, g);
+  var t: DxpPdfTextState;
+  dxp_pdfr_textstate_init(&t);
+
+  while (c.pos < c.len) {
+    dxp_pdfr_skip_ws(&c);
+    if (c.pos >= c.len) { break; }
+    var ch: uint8 = c.data[c.pos];
+    var is_val: bool = false;
+    if (ch == '(' || ch == '<' || ch == '[' || ch == '/' || ch == '+' ||
+        ch == '-' || ch == '.' || (ch >= '0' && ch <= '9')) {
+      is_val = true;
+    }
+    if (is_val) {
+      var v: DxpPdfVal* = dxp_pdfr_parse_val(&c, f->arena, 0);
+      if (v == 0) { c.pos = c.pos + 1; continue; }
+      dxp_vec_push<DxpPdfVal*>(&stack, v);
+      continue;
+    }
+    // Operator word.
+    var ks: int64 = c.pos;
+    while (c.pos < c.len && !dxp_pdfr_is_delim(c.data[c.pos])) { c.pos = c.pos + 1; }
+    if (c.pos == ks) { c.pos = c.pos + 1; continue; }
+    var op: string;
+    op.chars = c.data + ks;
+    op.length = (uint64)(c.pos - ks);
+
+    if (op == "q") {
+      var gs: DxpPdfGState = gstates.data[gstates.length - 1];
+      dxp_vec_push<DxpPdfGState>(&gstates, gs);
+    } else if (op == "Q") {
+      if (gstates.length > 1) {
+        gstates.length = gstates.length - 1;
+        g = gstates.data[gstates.length - 1];
+      }
+    } else if (op == "cm") {
+      if (stack.length >= 6) {
+        var a6: float64 = stack.data[stack.length - 6]->f;
+        var b6: float64 = stack.data[stack.length - 5]->f;
+        var c6: float64 = stack.data[stack.length - 4]->f;
+        var d6: float64 = stack.data[stack.length - 3]->f;
+        var e6: float64 = stack.data[stack.length - 2]->f;
+        var f6: float64 = stack.data[stack.length - 1]->f;
+        dxp_pdfr_matrix_mul(&g, a6, b6, c6, d6, e6, f6);
+      }
+    } else if (op == "BT") {
+      dxp_pdfr_textstate_init(&t);
+      t.in_text = true;
+    } else if (op == "ET") {
+      t.in_text = false;
+    } else if (op == "Tf") {
+      if (stack.length >= 2) {
+        var nv: DxpPdfVal* = stack.data[stack.length - 2];
+        if (nv->kind == DXP_PDF_NAME) { g.font_name = nv->s; }
+        g.font_size = stack.data[stack.length - 1]->f;
+      }
+    } else if (op == "TL") {
+      if (stack.length >= 1) { g.leading = stack.data[stack.length - 1]->f; }
+    } else if (op == "Tc") {
+      if (stack.length >= 1) { g.char_space = stack.data[stack.length - 1]->f; }
+    } else if (op == "Tw") {
+      if (stack.length >= 1) { g.word_space = stack.data[stack.length - 1]->f; }
+    } else if (op == "Tz") {
+      if (stack.length >= 1) { g.hscale = stack.data[stack.length - 1]->f / 100.0; }
+    } else if (op == "Td") {
+      if (stack.length >= 2) {
+        var tx: float64 = stack.data[stack.length - 2]->f;
+        var ty: float64 = stack.data[stack.length - 1]->f;
+        t.lm_e = t.lm_e + tx * t.lm_a + ty * t.lm_c;
+        t.lm_f = t.lm_f + tx * t.lm_b + ty * t.lm_d;
+        t.tm_a = t.lm_a; t.tm_b = t.lm_b; t.tm_c = t.lm_c; t.tm_d = t.lm_d;
+        t.tm_e = t.lm_e; t.tm_f = t.lm_f;
+      }
+    } else if (op == "TD") {
+      if (stack.length >= 2) {
+        var tx2: float64 = stack.data[stack.length - 2]->f;
+        var ty2: float64 = stack.data[stack.length - 1]->f;
+        g.leading = -ty2;
+        t.lm_e = t.lm_e + tx2 * t.lm_a + ty2 * t.lm_c;
+        t.lm_f = t.lm_f + tx2 * t.lm_b + ty2 * t.lm_d;
+        t.tm_a = t.lm_a; t.tm_b = t.lm_b; t.tm_c = t.lm_c; t.tm_d = t.lm_d;
+        t.tm_e = t.lm_e; t.tm_f = t.lm_f;
+      }
+    } else if (op == "Tm") {
+      if (stack.length >= 6) {
+        t.tm_a = stack.data[stack.length - 6]->f;
+        t.tm_b = stack.data[stack.length - 5]->f;
+        t.tm_c = stack.data[stack.length - 4]->f;
+        t.tm_d = stack.data[stack.length - 3]->f;
+        t.tm_e = stack.data[stack.length - 2]->f;
+        t.tm_f = stack.data[stack.length - 1]->f;
+        t.lm_a = t.tm_a; t.lm_b = t.tm_b; t.lm_c = t.tm_c; t.lm_d = t.tm_d;
+        t.lm_e = t.tm_e; t.lm_f = t.tm_f;
+      }
+    } else if (op == "T*") {
+      t.lm_e = t.lm_e - g.leading * t.lm_c;
+      t.lm_f = t.lm_f - g.leading * t.lm_d;
+      t.tm_a = t.lm_a; t.tm_b = t.lm_b; t.tm_c = t.lm_c; t.tm_d = t.lm_d;
+      t.tm_e = t.lm_e; t.tm_f = t.lm_f;
+    } else if (op == "Tj") {
+      if (stack.length >= 1) { dxp_pdfr_apply_tj(chunks, f, fonts, &g, &t, page, stack.data[stack.length - 1]); }
+    } else if (op == "TJ") {
+      if (stack.length >= 1) { dxp_pdfr_apply_tj(chunks, f, fonts, &g, &t, page, stack.data[stack.length - 1]); }
+    } else if (op == "'") {
+      t.lm_e = t.lm_e - g.leading * t.lm_c;
+      t.lm_f = t.lm_f - g.leading * t.lm_d;
+      t.tm_a = t.lm_a; t.tm_b = t.lm_b; t.tm_c = t.lm_c; t.tm_d = t.lm_d;
+      t.tm_e = t.lm_e; t.tm_f = t.lm_f;
+      if (stack.length >= 1) { dxp_pdfr_apply_tj(chunks, f, fonts, &g, &t, page, stack.data[stack.length - 1]); }
+    } else if (op == "\"") {
+      if (stack.length >= 3) {
+        g.word_space = stack.data[stack.length - 3]->f;
+        g.char_space = stack.data[stack.length - 2]->f;
+        t.lm_e = t.lm_e - g.leading * t.lm_c;
+        t.lm_f = t.lm_f - g.leading * t.lm_d;
+        t.tm_a = t.lm_a; t.tm_b = t.lm_b; t.tm_c = t.lm_c; t.tm_d = t.lm_d;
+        t.tm_e = t.lm_e; t.tm_f = t.lm_f;
+        dxp_pdfr_apply_tj(chunks, f, fonts, &g, &t, page, stack.data[stack.length - 1]);
+      }
+    } else if (op == "BI") {
+      // Skip inline image data through EI.
+      while (c.pos < c.len) {
+        if (c.data[c.pos] == 'I' && c.pos + 1 < c.len && c.data[c.pos + 1] == 'D') {
+          c.pos = c.pos + 2;
+          break;
+        }
+        c.pos = c.pos + 1;
+      }
+      while (c.pos + 1 < c.len) {
+        if (c.data[c.pos] == 'E' && c.data[c.pos + 1] == 'I' &&
+            (c.pos == 0 || dxp_pdfr_is_ws(c.data[c.pos - 1]))) {
+          c.pos = c.pos + 2;
+          break;
+        }
+        c.pos = c.pos + 1;
+      }
+    }
+    stack.length = 0;
+  }
+  dxp_vec_free<DxpPdfVal*>(&stack);
+  dxp_vec_free<DxpPdfGState>(&gstates);
+}
+
+fn dxp_pdfr_collect_pages(f: DxpPdfFile*, node: DxpPdfVal*, inherited: DxpPdfVal*,
+                          out: DxpVec<DxpPdfPageInfo>*) {
+  var n: DxpPdfVal* = dxp_pdfr_resolve(f, node);
+  if (n == 0 || n->kind != DXP_PDF_DICT) { return; }
+  var res: DxpPdfVal* = dxp_pdfr_dict_get(n, "Resources");
+  if (res == 0) { res = inherited; }
+  var typ: DxpPdfVal* = dxp_pdfr_dict_get(n, "Type");
+  if (dxp_pdfr_name_is(typ, "Page") || dxp_pdfr_dict_get(n, "Contents") != 0) {
+    var pi: DxpPdfPageInfo;
+    pi.page = n;
+    pi.resources = res;
+    pi.w = 612.0;
+    pi.h = 792.0;
+    var mb: DxpPdfVal* = dxp_pdfr_dict_get(n, "MediaBox");
+    if (mb == 0) { mb = dxp_pdfr_dict_get(n, "CropBox"); }
+    mb = dxp_pdfr_resolve(f, mb);
+    if (mb != 0 && mb->kind == DXP_PDF_ARRAY && mb->arr.length >= 4) {
+      var x0: float64 = dxp_pdfr_num(mb->arr.data[0], 0.0);
+      var y0: float64 = dxp_pdfr_num(mb->arr.data[1], 0.0);
+      var x1: float64 = dxp_pdfr_num(mb->arr.data[2], 612.0);
+      var y1: float64 = dxp_pdfr_num(mb->arr.data[3], 792.0);
+      if (x1 > x0) { pi.w = x1 - x0; }
+      if (y1 > y0) { pi.h = y1 - y0; }
+    }
+    dxp_vec_push<DxpPdfPageInfo>(out, pi);
+    return;
+  }
+  var kids: DxpPdfVal* = dxp_pdfr_dict_get(n, "Kids");
+  kids = dxp_pdfr_resolve(f, kids);
+  if (kids != 0 && kids->kind == DXP_PDF_ARRAY) {
+    for i in 0..kids->arr.length {
+      dxp_pdfr_collect_pages(f, kids->arr.data[i], res, out);
+    }
+  }
+}
+
+fn dxp_pdfr_page_content(f: DxpPdfFile*, page: DxpPdfVal*, out: DxpBuf*) {
+  var cont: DxpPdfVal* = dxp_pdfr_dict_get(page, "Contents");
+  if (cont == 0) { return; }
+  if (cont->kind == DXP_PDF_REF) {
+    var o: DxpPdfObj* = dxp_pdfr_find_obj(f, cont->ref_num);
+    if (o != 0 && o->has_stream) { dxp_pdfr_decode_stream(f, o, out); }
+    else if (o != 0 && o->val != 0 && o->val->kind == DXP_PDF_ARRAY) {
+      var av: DxpPdfVal* = o->val;
+      for i in 0..av->arr.length {
+        var cv: DxpPdfVal* = av->arr.data[i];
+        if (cv->kind == DXP_PDF_REF) {
+          var co: DxpPdfObj* = dxp_pdfr_find_obj(f, cv->ref_num);
+          if (co != 0) { dxp_pdfr_decode_stream(f, co, out); }
+        }
+        dxp_buf_put(out, (uint8)'\n');
+      }
+    }
+  } else if (cont->kind == DXP_PDF_ARRAY) {
+    for i in 0..cont->arr.length {
+      var cv: DxpPdfVal* = cont->arr.data[i];
+      var co: DxpPdfObj* = 0;
+      if (cv->kind == DXP_PDF_REF) { co = dxp_pdfr_find_obj(f, cv->ref_num); }
+      if (co != 0) { dxp_pdfr_decode_stream(f, co, out); }
+      dxp_buf_put(out, (uint8)'\n');
+    }
+  } else if (cont->kind == DXP_PDF_DICT) {
+    // A direct stream object is represented as a dict only when Length was
+    // indirect; scan for its stream through the object list is impossible
+    // here, so the normal ref path above is what matters.
+  }
+}
+
+fn dxp_pdfr_sort_chunks(chunks: DxpVec<DxpPdfChunk>*, start: int64, end: int64) {
+  // Insertion sort by page, y descending, x ascending.
+  var i: int64 = start + 1;
+  while (i < end) {
+    var v: DxpPdfChunk = chunks->data[i];
+    var j: int64 = i - 1;
+    while (j >= start) {
+      var a: DxpPdfChunk* = &chunks->data[j];
+      var before: bool = false;
+      if (a->page < v.page) { before = true; }
+      else if (a->page == v.page) {
+        if (a->y > v.y + 0.01) { before = true; }
+        else if (a->y >= v.y - 0.01 && a->x <= v.x) { before = true; }
+      }
+      if (before) { break; }
+      chunks->data[j + 1] = *a;
+      j = j - 1;
+    }
+    chunks->data[j + 1] = v;
+    i = i + 1;
+  }
+}
+
+fn dxp_pdfr_is_cjk(s: string) -> bool {
+  if (s.length == 0) { return false; }
+  var c: uint8 = s.chars[0];
+  return c >= 0xE3 && c <= 0xEA;
+}
+
+fn dxp_pdfr_list_start(s: string) -> bool {
+  if (s.length == 0) { return false; }
+  var c: uint8 = s.chars[0];
+  if (c == 0xE2 || c == '-' || c == '*' || c == 0x95) { return true; }
+  var i: int64 = 0;
+  while (i < (int64)s.length && s.chars[i] >= '0' && s.chars[i] <= '9') { i = i + 1; }
+  if (i > 0 && i + 1 < (int64)s.length) {
+    var d: uint8 = s.chars[i];
+    if (d == '.' || d == ')') { return true; }
+  }
+  return false;
+}
+
+fn dxp_pdfr_build_doc(f: DxpPdfFile*, pages: DxpVec<DxpPdfPageInfo>*,
+                      chunks: DxpVec<DxpPdfChunk>*, doc: DxpDocument*) {
+  dxp_doc_init(doc);
+  if (pages->length > 0) {
+    doc->page_w = pages->data[0].w;
+    doc->page_h = pages->data[0].h;
+    doc->margin_l = 54.0;
+    doc->margin_r = 54.0;
+    doc->margin_t = 54.0;
+    doc->margin_b = 54.0;
+    doc->default_size = 11.0;
+  }
+  if (chunks->length == 0) { return; }
+  dxp_pdfr_sort_chunks(chunks, 0, chunks->length);
+
+  var i: int64 = 0;
+  var last_page: int32 = -1;
+  var prev_y: float64 = 0.0;
+  var prev_size: float64 = 0.0;
+  var have_para: bool = false;
+  var para: DxpParagraph;
+  dxp_para_init(&para);
+
+  while (i < chunks->length) {
+    var c: DxpPdfChunk = chunks->data[i];
+    if (c.page != last_page) {
+      if (have_para) {
+        var pb: DxpParagraph = para;
+        dxp_doc_add_para(doc, pb);
+        dxp_para_init(&para);
+        have_para = false;
+      }
+      if (last_page >= 0) { dxp_doc_add_pagebreak(doc); }
+      last_page = c.page;
+      prev_y = c.y;
+      prev_size = c.size;
+    }
+    // Build one line: chunks at similar y.
+    var line_text: DxpBuf;
+    var line_size: float64 = c.size;
+    var line_bold: bool = c.bold;
+    var line_italic: bool = c.italic;
+    var line_y: float64 = c.y;
+    var last_x: float64 = c.x;
+    var last_size: float64 = c.size;
+    dxp_buf_puts(&line_text, c.text);
+    last_x = c.x + c.adv;
+    i = i + 1;
+    while (i < chunks->length) {
+      var c2: DxpPdfChunk = chunks->data[i];
+      if (c2.page != c.page) { break; }
+      var tol: float64 = c2.size;
+      if (line_size > tol) { tol = line_size; }
+      tol = tol * 0.35;
+      if (c2.y < line_y - tol || c2.y > line_y + tol) { break; }
+      var prev_cjk: bool = false;
+      if (line_text.len >= 3) {
+        var pb0: uint8 = line_text.data[line_text.len - 3];
+        if (pb0 >= 0xE3 && pb0 <= 0xEA) { prev_cjk = true; }
+      }
+      if (c2.x > last_x + last_size * 0.10 &&
+          line_text.len > 0 && line_text.data[line_text.len - 1] != ' ' &&
+          c2.text.length > 0 && c2.text.chars[0] != ' ' &&
+          !prev_cjk && !dxp_pdfr_is_cjk(c2.text)) {
+        dxp_buf_put(&line_text, (uint8)' ');
+      }
+      dxp_buf_puts(&line_text, c2.text);
+      last_x = c2.x + c2.adv;
+      last_size = c2.size;
+      if (c2.size > line_size) { line_size = c2.size; }
+      i = i + 1;
+    }
+    var line: string = dxp_str_dup_arena(f->arena, dxp_buf_view(&line_text));
+    dxp_buf_free(&line_text);
+
+    // New paragraph when the vertical gap is large or the size changes a lot.
+    var gap: float64 = prev_y - line_y;
+    var new_para: bool = false;
+    if (!have_para) { new_para = true; }
+    else if (gap > prev_size * 1.35) { new_para = true; }
+    else if (line_size > prev_size * 1.25 || prev_size > line_size * 1.25) { new_para = true; }
+    else if (dxp_pdfr_list_start(line)) { new_para = true; }
+    if (new_para) {
+      if (have_para) {
+        var old: DxpParagraph = para;
+        dxp_doc_add_para(doc, old);
+        dxp_para_init(&para);
+      }
+      para.size = line_size;
+      para.heading = 0;
+      if (line_size >= 15.0) { para.heading = 1; }
+      else if (line_size >= 13.0) { para.heading = 2; }
+      have_para = true;
+    } else {
+      // Join wrapped lines with a space.
+      if (line.length > 0) {
+        var sp: DxpRun;
+        dxp_run_init(&sp);
+        sp.text = " ";
+        sp.size = para.size;
+        dxp_vec_push<DxpRun>(&para.runs, sp);
+      }
+    }
+    var run: DxpRun;
+    dxp_run_init(&run);
+    run.text = line;
+    run.size = line_size;
+    run.bold = line_bold;
+    run.italic = line_italic;
+    dxp_vec_push<DxpRun>(&para.runs, run);
+    prev_y = line_y;
+    prev_size = line_size;
+  }
+  if (have_para) {
+    var last: DxpParagraph = para;
+    dxp_doc_add_para(doc, last);
+  }
+}
+
+fn dxp_pdfr_raw_contains(data: uint8*, len: int64, needle: string) -> bool {
+  if (needle.length == 0 || len < (int64)needle.length) { return false; }
+  var i: int64 = 0;
+  while (i + (int64)needle.length <= len) {
+    var ok: bool = true;
+    var j: int64 = 0;
+    while (j < (int64)needle.length) {
+      if (data[i + j] != needle.chars[j]) { ok = false; break; }
+      j = j + 1;
+    }
+    if (ok) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+export fn dxp_pdf_read(data: uint8*, len: int64, arena: Arena*,
+                       doc: DxpDocument*) -> int32 {
+  dxp_doc_init(doc);
+  if (dxp_pdfr_raw_contains(data, len, "/Encrypt")) {
+    return -3;
+  }
+  var f: DxpPdfFile;
+  f.data = data;
+  f.len = len;
+  f.arena = arena;
+  f.objs = dxp_vec_init<DxpPdfObj>();
+  f.root = 0;
+  dxp_pdfr_parse_objects(&f);
+  dxp_pdfr_expand_objstms(&f);
+  f.root = dxp_pdfr_find_root(&f);
+  if (f.root == 0) {
+    dxp_vec_free<DxpPdfObj>(&f.objs);
+    return -1;
+  }
+  var pages: DxpVec<DxpPdfPageInfo> = dxp_vec_init<DxpPdfPageInfo>();
+  var root_pages: DxpPdfVal* = dxp_pdfr_dict_get(f.root, "Pages");
+  dxp_pdfr_collect_pages(&f, root_pages, 0, &pages);
+  if (pages.length == 0) {
+    dxp_vec_free<DxpPdfPageInfo>(&pages);
+    dxp_vec_free<DxpPdfObj>(&f.objs);
+    return -2;
+  }
+
+  var chunks: DxpVec<DxpPdfChunk> = dxp_vec_init<DxpPdfChunk>();
+  for pi in 0..pages.length {
+    var page: DxpPdfPageInfo* = &pages.data[pi];
+    var fonts: DxpVec<DxpPdfFont> = dxp_vec_init<DxpPdfFont>();
+    dxp_pdfr_build_fonts(&f, page->resources, &fonts);
+    var content: DxpBuf;
+    dxp_pdfr_page_content(&f, page->page, &content);
+    if (content.len > 0) {
+      dxp_pdfr_content(&f, content.data, content.len, (int32)pi, &fonts, &chunks);
+    }
+    dxp_buf_free(&content);
+    for fi in 0..fonts.length {
+      dxp_vec_free<DxpPdfCMapRange>(&fonts.data[fi].cmap.ranges);
+      dxp_vec_free<DxpPdfCodeName>(&fonts.data[fi].diffs);
+      dxp_vec_free<float64>(&fonts.data[fi].widths);
+    }
+    dxp_vec_free<DxpPdfFont>(&fonts);
+  }
+
+  dxp_pdfr_build_doc(&f, &pages, &chunks, doc);
+  dxp_vec_free<DxpPdfChunk>(&chunks);
+  dxp_vec_free<DxpPdfPageInfo>(&pages);
+  dxp_vec_free<DxpPdfObj>(&f.objs);
+  return 0;
+}

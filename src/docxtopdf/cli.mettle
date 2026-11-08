@@ -1,0 +1,274 @@
+// Command line front end.
+//
+//   docxtopdf input.docx [output.pdf]
+//   docxtopdf input.pdf  [output.docx]
+//   docxtopdf convert input output
+//   docxtopdf docx2pdf input [output]
+//   docxtopdf pdf2docx input [output]
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "std/arena";
+import "buf";
+import "model";
+import "docx_read";
+import "docx_write";
+import "pdf_read";
+import "pdf_write";
+
+extern fn fseek(fp: cstring, off: int64, whence: int32) -> int32 = "fseek";
+extern fn ftell(fp: cstring) -> int64 = "ftell";
+
+fn dxp_cli_lower(c: uint8) -> uint8 {
+  if (c >= 'A' && c <= 'Z') { return (uint8)(c + 32); }
+  return c;
+}
+
+fn dxp_cli_eq_ci(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  var i: int64 = 0;
+  while (i < (int64)a.length) {
+    if (dxp_cli_lower(a.chars[i]) != dxp_cli_lower(b.chars[i])) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn dxp_cli_ext(path: string) -> string {
+  var slash: int64 = -1;
+  var dot: int64 = -1;
+  var i: int64 = 0;
+  while (i < (int64)path.length) {
+    var c: uint8 = path.chars[i];
+    if (c == '/' || c == '\\') { slash = i; dot = -1; }
+    else if (c == '.') { dot = i; }
+    i = i + 1;
+  }
+  if (dot <= slash || dot < 0) { return ""; }
+  return str_slice(path, dot + 1, (int64)path.length - dot - 1);
+}
+
+fn dxp_cli_has_ext(path: string, ext: string) -> bool {
+  return dxp_cli_eq_ci(dxp_cli_ext(path), ext);
+}
+
+fn dxp_cli_stem(path: string) -> string {
+  var slash: int64 = -1;
+  var dot: int64 = -1;
+  var i: int64 = 0;
+  while (i < (int64)path.length) {
+    var c: uint8 = path.chars[i];
+    if (c == '/' || c == '\\') { slash = i; dot = -1; }
+    else if (c == '.') { dot = i; }
+    i = i + 1;
+  }
+  if (dot <= slash || dot < 0) { return path; }
+  return str_slice(path, 0, dot);
+}
+
+fn dxp_cli_sniff(data: uint8*, len: int64) -> int32 {
+  if (len >= 5 && data[0] == '%' && data[1] == 'P' && data[2] == 'D' &&
+      data[3] == 'F' && data[4] == '-') {
+    return 2; // PDF
+  }
+  if (len >= 4 && data[0] == 'P' && data[1] == 'K' && data[2] == 3 && data[3] == 4) {
+    return 1; // DOCX/ZIP
+  }
+  return 0;
+}
+
+fn dxp_cli_read_file(path: cstring, len_out: int64*) -> uint8* {
+  var fp: cstring = fopen(path, "rb");
+  if (fp == 0) { return 0; }
+  if (fseek(fp, 0, 2) != 0) {
+    fclose(fp);
+    return 0;
+  }
+  var n: int64 = ftell(fp);
+  if (n < 0) { n = 0; }
+  if (fseek(fp, 0, 0) != 0) {
+    fclose(fp);
+    return 0;
+  }
+  var p: uint8* = (uint8*)malloc(n + 1);
+  if (p == 0) {
+    fclose(fp);
+    return 0;
+  }
+  var got: int64 = 0;
+  if (n > 0) { got = fread((cstring)p, 1, n, fp); }
+  fclose(fp);
+  if (got < 0) { got = 0; }
+  p[got] = 0;
+  *len_out = got;
+  return p;
+}
+
+fn dxp_cli_write_file(path: cstring, data: uint8*, len: int64) -> int32 {
+  var fp: cstring = fopen(path, "wb");
+  if (fp == 0) { return -1; }
+  var wrote: int64 = 0;
+  if (len > 0) { wrote = fwrite((cstring)data, 1, len, fp); }
+  fclose(fp);
+  if (wrote == len) { return 0; }
+  return -2;
+}
+
+fn dxp_cli_default_out(path: string, ext: string) -> DxpBuf {
+  var b: DxpBuf;
+  dxp_buf_init(&b, (int64)path.length + 8);
+  var stem: string = dxp_cli_stem(path);
+  dxp_buf_puts(&b, stem);
+  dxp_buf_put(&b, (uint8)'.');
+  dxp_buf_puts(&b, ext);
+  dxp_buf_put(&b, 0);
+  b.len = b.len - 1;
+  return b;
+}
+
+fn dxp_cli_usage() {
+  println_err("usage: docxtopdf INPUT [OUTPUT]");
+  println_err("       docxtopdf convert INPUT OUTPUT");
+  println_err("       docxtopdf docx2pdf INPUT [OUTPUT]");
+  println_err("       docxtopdf pdf2docx INPUT [OUTPUT]");
+}
+
+fn dxp_cli_run(input_path: string, output_path: string, force: int32) -> int32 {
+  var in_len: int64 = 0;
+  var in_data: uint8* = dxp_cli_read_file((cstring)input_path.chars, &in_len);
+  if (in_data == 0) {
+    print_err("docxtopdf: cannot read ");
+    println_err(input_path);
+    return 1;
+  }
+  var kind: int32 = 0;
+  if (force != 0) { kind = force; }
+  else if (dxp_cli_has_ext(input_path, "docx")) { kind = 1; }
+  else if (dxp_cli_has_ext(input_path, "pdf")) { kind = 2; }
+  else { kind = dxp_cli_sniff(in_data, in_len); }
+  if (kind == 0) {
+    free(in_data);
+    println_err("docxtopdf: input is neither a .docx package nor a PDF");
+    return 1;
+  }
+
+  var out: DxpBuf;
+  dxp_buf_init(&out, 8192);
+  var arena: Arena* = arena_init(65536);
+  var doc: DxpDocument;
+  var rc: int32 = 0;
+  if (kind == 1) {
+    rc = dxp_docx_read(in_data, in_len, arena, &doc);
+    if (rc != 0) {
+      println_err("docxtopdf: cannot read the DOCX package");
+    } else {
+      rc = dxp_pdf_write(&doc, &out);
+      if (rc != 0) { println_err("docxtopdf: cannot write the PDF"); }
+    }
+  } else {
+    rc = dxp_pdf_read(in_data, in_len, arena, &doc);
+    if (rc != 0) {
+      println_err("docxtopdf: cannot read the PDF");
+    } else {
+      rc = dxp_docx_write(&doc, &out);
+      if (rc != 0) { println_err("docxtopdf: cannot write the DOCX"); }
+    }
+  }
+  if (rc == 0) {
+    if (dxp_cli_write_file((cstring)output_path.chars, out.data, out.len) != 0) {
+      print_err("docxtopdf: cannot write ");
+      println_err(output_path);
+      rc = 1;
+    }
+  }
+  dxp_doc_free(&doc);
+  arena_free(arena);
+  dxp_buf_free(&out);
+  free(in_data);
+  if (rc == 0) { return 0; }
+  return 1;
+}
+
+export fn dxp_main(argc: int32, argv: cstring*) -> int32 {
+  if (argc < 2) {
+    dxp_cli_usage();
+    return 1;
+  }
+  var a1: string = str_from_cstr(argv[1]);
+  if (a1 == "--help" || a1 == "-h" || a1 == "help") {
+    dxp_cli_usage();
+    return 0;
+  }
+  if (a1 == "--version" || a1 == "-V") {
+    println("docxtopdf 0.1.0");
+    return 0;
+  }
+
+  var input_path: string = "";
+  var output_arg: string = "";
+  var force: int32 = 0;
+  if (a1 == "convert") {
+    if (argc < 4) { dxp_cli_usage(); return 1; }
+    input_path = str_from_cstr(argv[2]);
+    output_arg = str_from_cstr(argv[3]);
+  } else if (a1 == "docx2pdf") {
+    if (argc < 3) { dxp_cli_usage(); return 1; }
+    input_path = str_from_cstr(argv[2]);
+    force = 1;
+    if (argc >= 4) { output_arg = str_from_cstr(argv[3]); }
+  } else if (a1 == "pdf2docx") {
+    if (argc < 3) { dxp_cli_usage(); return 1; }
+    input_path = str_from_cstr(argv[2]);
+    force = 2;
+    if (argc >= 4) { output_arg = str_from_cstr(argv[3]); }
+  } else {
+    input_path = a1;
+    if (argc >= 3) { output_arg = str_from_cstr(argv[2]); }
+  }
+
+  if (input_path.length == 0) {
+    dxp_cli_usage();
+    return 1;
+  }
+
+  // The output extension decides the direction unless a subcommand forced it.
+  var out_is_pdf: bool = false;
+  if (output_arg.length > 0) {
+    if (dxp_cli_has_ext(output_arg, "pdf")) { out_is_pdf = true; }
+    else if (dxp_cli_has_ext(output_arg, "docx")) { out_is_pdf = false; }
+    else {
+      out_is_pdf = dxp_cli_has_ext(input_path, "docx") || force == 1;
+    }
+  } else {
+    out_is_pdf = dxp_cli_has_ext(input_path, "docx") || force == 1;
+    if (!out_is_pdf && force == 0) { out_is_pdf = false; }
+  }
+
+  var out_buf: DxpBuf;
+  if (output_arg.length > 0) {
+    dxp_buf_init(&out_buf, 0);
+    dxp_buf_puts(&out_buf, output_arg);
+    dxp_buf_put(&out_buf, 0);
+    out_buf.len = out_buf.len - 1;
+  } else {
+    if (out_is_pdf) { out_buf = dxp_cli_default_out(input_path, "pdf"); }
+    else { out_buf = dxp_cli_default_out(input_path, "docx"); }
+  }
+  var output_path: string = dxp_buf_view(&out_buf);
+
+  // The requested output extension wins; otherwise the input decides.
+  var run_force: int32 = force;
+  if (output_arg.length > 0) {
+    if (dxp_cli_has_ext(output_arg, "pdf")) { run_force = 1; }
+    else if (dxp_cli_has_ext(output_arg, "docx")) { run_force = 2; }
+  }
+  if (run_force == 0) {
+    if (dxp_cli_has_ext(input_path, "docx")) { run_force = 1; }
+    else if (dxp_cli_has_ext(input_path, "pdf")) { run_force = 2; }
+    else { run_force = 0; }
+  }
+  var rc: int32 = dxp_cli_run(input_path, output_path, run_force);
+  dxp_buf_free(&out_buf);
+  return rc;
+}
